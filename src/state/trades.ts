@@ -26,6 +26,10 @@ export interface TradeRecord {
   errorCode: number | null;
   errorMessage: string | null;
   createdAt: number;
+  /** Stratégie à l'origine du trade (moteur uniquement). */
+  strategy?: string | null;
+  /** Déclencheur : entry, stop_loss, take_profit, trailing_stop, momentum_exit… */
+  trigger?: string | null;
 }
 
 interface TradeRow {
@@ -48,6 +52,8 @@ interface TradeRow {
   error_code: number | null;
   error_message: string | null;
   created_at: number;
+  strategy: string | null;
+  trigger: string | null;
 }
 
 /** Journalise une intention de swap. Retourne l'id de la ligne créée. */
@@ -57,8 +63,9 @@ export function insertTrade(db: DatabaseSync, trade: TradeRecord): number {
       `INSERT INTO trades
         (mode, status, signature, request_id, input_mint, output_mint, in_amount,
          expected_out_amount, out_amount, router, fee_bps, fee_mint, price_impact,
-         slippage_bps, realized_slippage_bps, error_code, error_message, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         slippage_bps, realized_slippage_bps, error_code, error_message, created_at,
+         strategy, trigger)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       trade.mode,
@@ -79,8 +86,29 @@ export function insertTrade(db: DatabaseSync, trade: TradeRecord): number {
       trade.errorCode,
       trade.errorMessage,
       trade.createdAt,
+      trade.strategy ?? null,
+      trade.trigger ?? null,
     ) as unknown as { lastInsertRowid: number | bigint };
   return Number(result.lastInsertRowid);
+}
+
+/** Horodatage du dernier trade touchant ce mint (entrée ou sortie), pour les cooldowns. */
+export function lastTradeTsForMint(db: DatabaseSync, mint: string): number | null {
+  const row = db
+    .prepare('SELECT MAX(created_at) AS ts FROM trades WHERE input_mint = ? OR output_mint = ?')
+    .get(mint, mint) as unknown as { ts: number | null } | undefined;
+  return row?.ts ?? null;
+}
+
+/** Complète un trade déjà journalisé (stratégie, déclencheur) — moteur uniquement. */
+export function annotateTrade(
+  db: DatabaseSync,
+  id: number,
+  fields: { strategy?: string; trigger?: string },
+): void {
+  db.prepare(
+    'UPDATE trades SET strategy = COALESCE(?, strategy), trigger = COALESCE(?, trigger) WHERE id = ?',
+  ).run(fields.strategy ?? null, fields.trigger ?? null, id);
 }
 
 /** Derniers trades journalisés (du plus récent au plus ancien). */
@@ -108,5 +136,7 @@ export function getRecentTrades(db: DatabaseSync, limit = 20): Array<TradeRecord
     errorCode: row.error_code,
     errorMessage: row.error_message,
     createdAt: row.created_at,
+    strategy: row.strategy,
+    trigger: row.trigger,
   }));
 }

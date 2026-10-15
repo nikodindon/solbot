@@ -5,6 +5,8 @@ export interface TokenBalance {
   mint: string;
   /** Montant en unités UI (décimales appliquées). */
   amount: number;
+  /** Montant exact en unités de base (texte, u64). */
+  amountBaseUnits: string;
   decimals: number;
 }
 
@@ -49,8 +51,26 @@ export async function fetchTokenBalances(
           : Number.parseFloat(raw.uiAmountString ?? '0');
       if (!Number.isFinite(amount) || amount <= 0) continue;
 
-      balances.push({ mint: info.mint, amount, decimals: raw.decimals ?? 0 });
+      const decimals = raw.decimals ?? 0;
+      balances.push({
+        mint: info.mint,
+        amount,
+        amountBaseUnits: uiStringToBaseUnits(raw.uiAmountString ?? String(amount), decimals),
+        decimals,
+      });
     }
   }
   return balances;
+}
+
+/**
+ * « 1.25 » + 6 décimales → « 1250000 » (texte u64, sans perte de précision).
+ * Toute chaîne non numérique est traitée comme 0.
+ */
+export function uiStringToBaseUnits(uiAmount: string, decimals: number): string {
+  const match = /^(\d+)(?:\.(\d*))?$/.exec(uiAmount.trim());
+  if (match === null) return '0';
+  const integer = match[1]!;
+  const fraction = (match[2] ?? '').slice(0, decimals).padEnd(decimals, '0');
+  return BigInt(`${integer}${fraction}`).toString();
 }

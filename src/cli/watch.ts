@@ -93,7 +93,7 @@ export async function runWatch(options: WatchOptions = {}): Promise<void> {
     let cycle = 0;
     do {
       cycle += 1;
-      const summary = await pollOnce({ db, priceApi, mints });
+      const summary = await pollOnce({ db, priceApi, tokensApi, mints });
       console.log(
         `  ${clock(summary.ts)}  #${String(cycle).padStart(3)}  ` +
           `prix ${summary.priced}/${summary.requested}  ` +

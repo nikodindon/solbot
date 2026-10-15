@@ -1,6 +1,6 @@
 {
   "name": "solbot",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Bot de trading spot autonome sur Solana via Jupiter (Swap API V2)",
   "private": true,
   "type": "module",

@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { openDatabase } from '../src/state/db.js';
 import { runMigrations } from '../src/state/migrations.js';
-import { getRecentTrades, insertTrade, type TradeRecord } from '../src/state/trades.js';
+import {
+  annotateTrade,
+  getRecentTrades,
+  insertTrade,
+  lastTradeTsForMint,
+  type TradeRecord,
+} from '../src/state/trades.js';
 
 function record(overrides: Partial<TradeRecord> = {}): TradeRecord {
   return {
@@ -23,6 +29,8 @@ function record(overrides: Partial<TradeRecord> = {}): TradeRecord {
     errorCode: null,
     errorMessage: null,
     createdAt: 1_000,
+    strategy: 'momentum',
+    trigger: 'entry',
     ...overrides,
   };
 }
@@ -76,6 +84,31 @@ describe('trades', () => {
     }
     expect(getRecentTrades(db, 2)).toHaveLength(2);
     expect(getRecentTrades(db, 2)[0]?.createdAt).toBe(4);
+    db.close();
+  });
+
+  it('annote un trade journalisé (stratégie, déclencheur)', () => {
+    const db = memoryDb();
+    const id = insertTrade(db, record({ strategy: null, trigger: null }));
+
+    annotateTrade(db, id, { strategy: 'momentum', trigger: 'stop_loss' });
+
+    expect(getRecentTrades(db)[0]).toMatchObject({ strategy: 'momentum', trigger: 'stop_loss' });
+    db.close();
+  });
+
+  it('retrouve l’horodatage du dernier trade touchant un mint (cooldown)', () => {
+    const db = memoryDb();
+    const mint = 'M'.padEnd(43, 'z');
+    expect(lastTradeTsForMint(db, mint)).toBeNull();
+
+    insertTrade(db, record({ outputMint: mint, createdAt: 100 }));
+    insertTrade(
+      db,
+      record({ inputMint: mint, outputMint: 'Other'.padEnd(43, 'o'), createdAt: 300 }),
+    );
+
+    expect(lastTradeTsForMint(db, mint)).toBe(300);
     db.close();
   });
 });

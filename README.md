@@ -243,6 +243,14 @@ npm run solbot -- start --dry-run # obtient de vrais /order + simulation on-chai
 npm run solbot -- start --live    # ⚠ fonds réels — exige confirm_live: true en config
 ```
 
+Le moteur accepte aussi un arrêt automatique et un tick unique (vérifications rapides) :
+
+```bash
+npm run solbot -- start --once                          # un seul tick puis sortie
+npm run solbot -- start --paper --duration 3600         # s'arrête après 1 h
+npm run solbot -- start --paper --duration 172800 --interval 30   # run paper de 48 h
+```
+
 Le swap manuel suit la même logique — `solbot swap` respecte le mode de `config.yaml`, et les
 drapeaux `--dry-run` / `--live` le forcent (le live exige `confirm_live: true` + confirmation) :
 
@@ -328,7 +336,8 @@ strategies:                # chaque stratégie est activable/paramétrable indé
     enabled: true
     weight: 1.0
     timeframe: 15m
-    params: { ema_fast: 12, ema_slow: 26, rsi_period: 14, rsi_entry: 65, atr_stop_mult: 2.0 }
+    # atr_* + breakout_* + volume_* : paramètres du moteur (Phase 3)
+    params: { ema_fast: 12, ema_slow: 26, rsi_period: 14, rsi_entry: 65, atr_period: 14, atr_stop_mult: 2.0, breakout_lookback: 20, volume_mult: 1.5, volume_lookback: 20 }
   mean_reversion:
     enabled: false
     weight: 1.0
@@ -355,6 +364,13 @@ risk:                      # le RiskManager a toujours le dernier mot
   min_time_between_trades_s: 300
   max_price_impact_pct: 1.0    # rejet si l'impact estimé dépasse ce seuil
   sol_gas_reserve: 0.05        # SOL intouchable, réservé aux frais
+
+paper:                     # portefeuille virtuel (modes paper et dry-run)
+  initial_usdc: 1000           # caisse virtuelle de départ (USD)
+  fill_slippage_bps: 20        # slippage modélisé par fill (aller simple)
+
+engine:                    # moteur autonome (`solbot start`)
+  max_entries_per_tick: 1      # entrées max transmises au risque par tick (anti-rafale)
 
 execution:
   path: meta_aggregator        # meta_aggregator (/order+/execute) | router (/build)
@@ -398,18 +414,50 @@ interface Signal {
 ```
 
 Le **Signal Engine** collecte les signaux de toutes les stratégies activées, les pondère (`weight`),
-arbitre par score (`confiance × edge × fraîcheur`) et ne transmet au RiskManager qu'un nombre limité
-d'actions par tick (anti-rafale, anti-churn).
+arbitre par score (`confiance × poids`) et ne transmet au RiskManager qu'un nombre limité d'actions
+par tick (`engine.max_entries_per_tick`, défaut 1 — anti-rafale, anti-churn). Les signaux actionnables
+sont journalisés en base (`signals`, avec `acted`) et les rejets sont tracés à part (`risk_rejections`).
 
 | Stratégie | Principe | Signaux produits | Statut |
 |---|---|---|---|
-| **momentum** | EMA rapide/lente + filtre RSI + confirmation volume ; stops basés ATR | Entrée long sur breakout confirmé ; sortie sur croisement inverse | Phase 3 (première) |
+| **momentum** | EMA rapide/lente + filtre RSI + cassure des plus hauts + confirmation volume ; stop initial basé ATR | Entrée long sur breakout confirmé ; sortie sur tendance EMA inverse | ✅ Phase 3 (implémentée) |
 | **mean_reversion** | Z-score du prix vs moyenne glissante (ou grille adaptative autour d'une ancre) | Entrée quand déviation > seuil ; sortie au retour à la moyenne | Phase 4 |
 | **dca_rotation** | Allocation cible (ex. 40 % SOL / 60 % USDC), rééquilibrage par dérive | Achats/ventes de rééquilibrage périodiques | Phase 4 |
 | **copy_trade** | Surveillance de wallets performants (logs RPC / webhooks), réplication contrainte par le risque | Réplication proportionnelle du swap détecté | Phase 7 |
 
 > 🧪 Toute nouvelle stratégie se développe et se valide d'abord en **backtest** puis en **paper mode**
 > avant d'être autorisée en live (garde-fou : `enabled: false` par défaut).
+
+### 8.1 Le moteur autonome — `solbot start` (Phase 3)
+
+Un **tick** (toutes les `loop_interval_s`) enchaîne : relevé de marché (prix + volumes) → valorisation
+du portefeuille (NAV, PnL latent) → **sorties** (stop-loss, take-profit, trailing, signal de sortie —
+priorité absolue) → **entrées** (signaux actionnables, arbitrage, RiskManager, exécution). Un seul
+trade est en vol à la fois (verrou structurel) et la boucle attrape ses erreurs : 5 ticks en échec
+consécutifs arrêtent le moteur proprement.
+
+| Mode | Marché | Ordres | Portefeuille | Usage |
+|---|---|---|---|---|
+| `paper` | prix réels (API) | aucun | **virtuel** (`paper.initial_usdc`) | simulation complète, coûts modélisés (frais + slippage) |
+| `dry_run` | prix réels | **vrais `/order`** + simulation RPC | virtuel | vérifie l'exécutabilité réelle de chaque ordre, sans fonds |
+| `live` | prix réels | réels, signés | on-chain (RPC) | ⚠ fonds réels (`confirm_live: true` + « oui »/`--yes`) |
+
+Points de conception à connaître :
+
+- **Warm-up** — le momentum a besoin de ~27 bougies 15 m clôturées (≈ 6 h 45 de collecte `watch` ou de
+  moteur). En dessous, aucun signal ; `start` affiche le compteur `prêts x/y` par tick.
+- **Volume proxy** — l'OHLCV interne n'a pas le volume historique Jupiter : le volume par bougie est
+  estimé par le **delta des stats 24 h** (achats + ventes, Tokens v2) entre deux ticks. Le premier tick
+  d'un mint ne contribue pas (delta inconnu). Approximation documentée, suffisante pour le filtre de
+  confirmation (× 1,5 de la médiane).
+- **Kill-switch** — fichier `STOP` à la racine (`$SOLBOT_HOME`) : entrées coupées immédiatement, sorties
+  toujours exécutées. Créé automatiquement si le drawdown max est franchi ; supprimez-le pour reprendre.
+- **Perte journalière** — l'ancre NAV est posée à la première évaluation de chaque journée UTC ;
+  dépassement de `daily_loss_limit_pct` → entrées en pause jusqu'à minuit UTC (sorties actives).
+- **Reprise après crash (live)** — au démarrage, les soldes on-chain (RPC) font foi : chaque position
+  locale est adoptée, ajustée (FIFO) ou clôturée, et chaque décision est journalisée dans `events`.
+- **Journal** — `trades` (stratégie, déclencheur, mode), `signals`, `risk_rejections` (règle + métriques),
+  `events` : tout est en SQLite, dans `data/solbot.sqlite`.
 
 ---
 
@@ -514,7 +562,7 @@ Sharpe simplifié, et **slippage réalisé vs estimé** (le juge de paix de l'ex
 | 0 | v0.1.0 | Fondations : config, wallet, CLI, doctor — ✅ **réalisée** | nul (aucun trade) |
 | 1 | v0.2.0 | Données de marché : Price v3, Tokens v2, SQLite, scan — ✅ **réalisée** | nul |
 | 2 | v0.3.0 | Premier swap : `/order` + `/execute`, dry-run, erreurs — ✅ **réalisée** | faible (manuel, montants choisis) |
-| 3 | v0.4.0 | Moteur autonome mono-stratégie + risque complet | réel encadré |
+| 3 | v0.4.0 | Moteur autonome mono-stratégie + risque complet — ✅ **réalisée** | réel encadré |
 | 4 | v0.5.0 | Multi-stratégies + backtesting + paper complet | réel encadré |
 | 5 | v0.6.0 | Production 24/7 : Docker, Telegram, métriques, backups | réel encadré |
 | 6 | v0.7.0 | Exécution avancée : `/build`, tx.jup.ag, Jito, v1 txs | réel avancé |
@@ -569,18 +617,28 @@ insuffisants (`errorCode 1`) et slippage au-dessus du plafond, contre l'API main
 (dont le test `@integration`). ⏳ **Reste à valider dès que le wallet est financé** : aller-retour
 USDC→SOL→USDC de 10 USDC, slippage total < 1 %, deux swaps journalisés avec leur signature.
 
-### Phase 3 — Moteur autonome mono-stratégie (v0.4.0)
+### Phase 3 — Moteur autonome mono-stratégie (v0.4.0) — ✅ **réalisée**
 
-- [ ] Interface `Strategy` + registre + chargement depuis la config
-- [ ] Stratégie **momentum** complète (EMA 12/26, RSI, confirmation volume, stops ATR)
-- [ ] `Portfolio` : positions, cost basis FIFO, mark-to-market, PnL réalisé/latent, NAV en USDC
-- [ ] `RiskManager` complet (règles de la section 9) + table `risk_rejections`
-- [ ] Boucle principale (tick 30 s) + verrou monoconcurrence (1 trade en vol à la fois)
-- [ ] **Reprise après crash** : réconciliation on-chain au boot (soldes RPC vs base), décision automatique (adopter l'état chaîne)
-- [ ] SL / TP / trailing stop automatiques à chaque tick
-- [ ] **Kill-switch** : fichier `STOP` + arrêt propre sur SIGINT/SIGTERM (position conservée, entrées coupées)
+- [x] Interface `Strategy` + registre + chargement depuis la config (stratégie activée sans implémentation → erreur explicite)
+- [x] Stratégie **momentum** : breakout (`breakout_lookback` plus hauts) + EMA 12/26 + RSI < `rsi_entry` + confirmation volume (≥ `volume_mult` × médiane) ; sortie sur tendance EMA inverse ; stop initial ATR (`atr_stop_mult`)
+- [x] `Portfolio` : positions, lots FIFO (`position_lots`), cost basis, mark-to-market, PnL réalisé/latent, NAV
+- [x] `RiskManager` complet (section 9) + table `risk_rejections` (règle, message, métriques) — kill-switch, pause perte journalière (ancre UTC), plafonds, sizing (impact liquidité), cooldowns, réserve de gaz, notionnel minimum
+- [x] Boucle principale (`solbot start`, tick `loop_interval_s`) + verrou monoconcurrence (1 trade en vol) + arrêt propre SIGINT/SIGTERM (tick en cours terminé)
+- [x] **Reprise après crash** : réconciliation on-chain au boot en live (soldes RPC vs base) — adoption, ajustement FIFO, clôture, chaque décision dans `events`
+- [x] SL / TP / trailing stop automatiques à chaque tick (priorité absolue sur les entrées)
+- [x] **Kill-switch** : fichier `STOP` (entrées coupées, sorties actives) + création automatique sur drawdown max ; `engine_start`/`engine_stop`/`daily_loss_pause`/`drawdown_kill_switch` dans `events`
+- [x] Modes : **paper** (portefeuille virtuel), **dry-run** (vrais `/order` + simulation RPC, portefeuille virtuel), **live** (fonds réels, confirmation unique au démarrage)
+- [x] Volume proxy : delta des stats 24 h (Tokens v2) attribué aux bougies (`candles.volume_usd`)
 
-**DoD** : 48 h de paper mode en continu sans fuite mémoire ni position orpheline ; un kill-switch manuel coupe les entrées en < 1 tick ; un reboot forcé du process en pleine position est correctement réconcilié ; tous les rejets de risque sont motivés en base.
+**DoD** (état au 15/10/2026) : ✅ kill-switch manuel (`STOP`) coupe les entrées au tick suivant — couvert par
+tests (sorties toujours exécutées) ; ✅ réconciliation testée (adoption/ajustement/clôture) et branchée au boot
+live ; ✅ tous les rejets de risque sont en base avec leur règle ; ✅ arrêt propre vérifié (SIGINT/SIGTERM) ;
+✅ **191 tests** (moteur paper/dry-run/live simulé, risque règle par règle, FIFO, trailing, réconciliation).
+⏳ **Reste à observer** : 48 h de paper mode en continu (`start --paper --duration 172800`) — à lancer
+hors session (tmux/nohup), aucun signe de fuite ni position orpheline attendu.
+
+> 📌 Tant que le wallet n'est pas financé, `dry-run`/`live` restent inutilisables (chaque `/order` échoue
+> avec `errorCode 1`) : c'est le comportement attendu. Le mode `paper` fonctionne sans aucun fonds.
 
 ### Phase 4 — Multi-stratégies & backtesting (v0.5.0)
 

@@ -18,6 +18,10 @@ export interface PriceTick {
   priceChange24h: number | null;
   blockId: number | null;
   ts: number;
+  /** Volume 24 h (USD) rapporté par Tokens v2 — proxy de volume pour le momentum. */
+  volume24hUsd?: number | null;
+  /** Delta de volume 24 h vs tick précédent, calculé à l'insertion (jamais stocké). */
+  volumeDeltaUsd?: number | null;
 }
 
 export interface CandleUpdate {
@@ -28,6 +32,8 @@ export interface CandleUpdate {
   high: number;
   low: number;
   close: number;
+  /** Volume (USD) attribué au tick dans ce bucket. */
+  volumeUsd: number;
 }
 
 /** Début du bucket contenant `ts` pour une durée de bougie donnée. */
@@ -52,6 +58,7 @@ export function ticksToCandleUpdates(ticks: PriceTick[]): CandleUpdate[] {
         high: tick.usdPrice,
         low: tick.usdPrice,
         close: tick.usdPrice,
+        volumeUsd: Math.max(0, tick.volumeDeltaUsd ?? 0),
       });
     }
   }

@@ -1,18 +1,14 @@
 import * as readline from 'node:readline/promises';
-import { LAMPORTS_PER_SOL, VersionedTransaction, type PublicKey } from '@solana/web3.js';
+import { LAMPORTS_PER_SOL, type PublicKey } from '@solana/web3.js';
 import { Command } from 'commander';
 import { SOL_MINT } from '../constants.js';
-import {
-  Executor,
-  type SimulateTransaction,
-  type SwapExecutionMode,
-  type SwapOutcome,
-} from '../execution/executor.js';
+import { Executor, type SwapExecutionMode, type SwapOutcome } from '../execution/executor.js';
 import { formatBaseUnits, maxSpendableBaseUnits, parseDecimalAmount } from '../execution/amount.js';
 import { JupiterClient } from '../jupiter/client.js';
 import { SwapApi, routerLabel, type OrderResponse } from '../jupiter/swap.js';
 import { TokensApi } from '../jupiter/tokens.js';
 import { resolveConnection } from '../solana/connection.js';
+import { buildSimulator } from '../solana/simulate.js';
 import { fetchTokenBalances } from '../solana/tokens.js';
 import { openDatabase, resolveDatabasePath } from '../state/db.js';
 import { runMigrations } from '../state/migrations.js';
@@ -89,7 +85,7 @@ export async function runSwap(
   runMigrations(db);
 
   try {
-    const simulate = mode === 'live' ? undefined : buildSimulator(await connect());
+    const simulate = mode === 'live' ? undefined : buildSimulator((await connect()).connection);
 
     if (mode === 'live') {
       await confirmLivePlannedSwap({
@@ -166,26 +162,6 @@ function lazyConnection(env: Env): () => ReturnType<typeof resolveConnection> {
   return () => {
     pending ??= resolveConnection(env);
     return pending;
-  };
-}
-
-function buildSimulator(
-  resolved: Awaited<ReturnType<typeof resolveConnection>>,
-): SimulateTransaction {
-  const { connection } = resolved;
-  return async (transactionBase64) => {
-    const transaction = VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
-    const response = await connection.simulateTransaction(transaction, {
-      sigVerify: false,
-      replaceRecentBlockhash: true,
-      commitment: 'confirmed',
-    });
-    const value = response.value;
-    return {
-      err: value.err ?? null,
-      unitsConsumed: value.unitsConsumed ?? null,
-      logsTail: (value.logs ?? []).slice(-5),
-    };
   };
 }
 

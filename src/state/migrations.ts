@@ -82,6 +82,97 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX idx_trades_created_at ON trades (created_at);
     `,
   },
+  {
+    version: 3,
+    name: 'engine',
+    sql: `
+      -- Position agrégée par actif (une position ouverte max par mint ; les lots
+      -- restants vivent dans position_lots pour le cost basis FIFO).
+      CREATE TABLE positions (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        mint                  TEXT NOT NULL,
+        symbol                TEXT NOT NULL,
+        decimals              INTEGER NOT NULL,
+        status                TEXT NOT NULL,               -- open | closed
+        qty                   TEXT NOT NULL,               -- unités de base (texte, u64)
+        qty_remaining         TEXT NOT NULL,
+        avg_entry_price_usd   REAL NOT NULL,
+        cost_basis_usd        REAL NOT NULL,               -- coût des unités restantes
+        realized_pnl_usd      REAL NOT NULL DEFAULT 0,
+        peak_price_usd        REAL,                        -- high-water mark (trailing)
+        stop_loss_price_usd   REAL,
+        take_profit_price_usd REAL,
+        opened_at             INTEGER NOT NULL,
+        updated_at            INTEGER NOT NULL,
+        closed_at             INTEGER
+      );
+      CREATE INDEX idx_positions_status ON positions (status);
+      CREATE INDEX idx_positions_mint ON positions (mint, status);
+
+      CREATE TABLE position_lots (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        position_id INTEGER NOT NULL REFERENCES positions(id),
+        qty         TEXT NOT NULL,                          -- unités de base restantes du lot
+        price_usd   REAL NOT NULL,
+        ts          INTEGER NOT NULL
+      );
+      CREATE INDEX idx_position_lots_position ON position_lots (position_id);
+
+      CREATE TABLE signals (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          INTEGER NOT NULL,
+        strategy    TEXT NOT NULL,
+        mint        TEXT NOT NULL,
+        symbol      TEXT NOT NULL,
+        side        TEXT NOT NULL,                          -- buy | sell
+        confidence  REAL NOT NULL,
+        edge_bps    REAL,
+        ttl_ms      INTEGER NOT NULL,
+        reason      TEXT NOT NULL,
+        acted       INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX idx_signals_ts ON signals (ts);
+
+      CREATE TABLE risk_rejections (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         INTEGER NOT NULL,
+        mint       TEXT NOT NULL,
+        symbol     TEXT NOT NULL,
+        side       TEXT NOT NULL,
+        strategy   TEXT NOT NULL,
+        rule       TEXT NOT NULL,
+        message    TEXT NOT NULL,
+        metrics    TEXT
+      );
+      CREATE INDEX idx_risk_rejections_ts ON risk_rejections (ts);
+
+      CREATE TABLE events (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts      INTEGER NOT NULL,
+        level   TEXT NOT NULL,                              -- info | warn | error
+        kind    TEXT NOT NULL,
+        message TEXT NOT NULL,
+        details TEXT
+      );
+      CREATE INDEX idx_events_ts ON events (ts);
+
+      CREATE TABLE bot_state (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      -- Ticks enrichis du volume 24 h (proxy de volume pour la confirmation momentum).
+      ALTER TABLE price_ticks ADD COLUMN volume_24h_usd REAL;
+
+      -- Volume agrégé par bougie (somme des deltas de volume 24 h dans le bucket).
+      ALTER TABLE candles ADD COLUMN volume_usd REAL NOT NULL DEFAULT 0;
+
+      -- Origine des trades exécutés par le moteur (audit signaux → exécution).
+      ALTER TABLE trades ADD COLUMN strategy TEXT;
+      ALTER TABLE trades ADD COLUMN trigger TEXT;
+    `,
+  },
 ];
 
 /** Applique les migrations manquantes. Retourne le nombre de migrations appliquées. */

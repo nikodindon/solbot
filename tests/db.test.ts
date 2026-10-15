@@ -19,10 +19,39 @@ function memoryDb() {
 describe('migrations', () => {
   it('applique les migrations une seule fois et_versionne', () => {
     const db = openDatabase(':memory:');
-    expect(runMigrations(db)).toBe(2);
+    expect(runMigrations(db)).toBe(3);
     expect(runMigrations(db)).toBe(0);
-    expect(currentSchemaVersion(db)).toBe(2);
+    expect(currentSchemaVersion(db)).toBe(3);
     expect(currentSchemaVersion(openDatabase(':memory:'))).toBe(0);
+    db.close();
+  });
+
+  it('crée les tables du moteur (v3)', () => {
+    const db = memoryDb();
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+      .all()
+      .map((row) => (row as unknown as { name: string }).name);
+    for (const table of [
+      'bot_state',
+      'events',
+      'position_lots',
+      'positions',
+      'risk_rejections',
+      'signals',
+    ]) {
+      expect(tables).toContain(table);
+    }
+    const tickColumns = db
+      .prepare('PRAGMA table_info(price_ticks)')
+      .all()
+      .map((row) => (row as unknown as { name: string }).name);
+    expect(tickColumns).toContain('volume_24h_usd');
+    const tradeColumns = db
+      .prepare('PRAGMA table_info(trades)')
+      .all()
+      .map((row) => (row as unknown as { name: string }).name);
+    expect(tradeColumns).toEqual(expect.arrayContaining(['strategy', 'trigger']));
     db.close();
   });
 });

@@ -52,7 +52,17 @@ const MOMENTUM_DEFAULT = {
   enabled: true,
   weight: 1,
   timeframe: '15m',
-  params: { ema_fast: 12, ema_slow: 26, rsi_period: 14, rsi_entry: 65, atr_stop_mult: 2.0 },
+  params: {
+    ema_fast: 12,
+    ema_slow: 26,
+    rsi_period: 14,
+    rsi_entry: 65,
+    atr_period: 14,
+    atr_stop_mult: 2.0,
+    breakout_lookback: 20,
+    volume_mult: 1.5,
+    volume_lookback: 20,
+  },
 };
 
 const StrategiesSchema = z.strictObject({
@@ -60,6 +70,17 @@ const StrategiesSchema = z.strictObject({
   mean_reversion: StrategySchema.default(StrategySchema.parse({})),
   dca_rotation: StrategySchema.default(StrategySchema.parse({})),
   copy_trade: StrategySchema.default(StrategySchema.parse({})),
+});
+
+const PaperSchema = z.strictObject({
+  initial_usdc: z.number().min(1).default(1000),
+  /** Slippage modélisé sur chaque fill paper (aller simple). */
+  fill_slippage_bps: z.number().int().min(0).max(500).default(20),
+});
+
+const EngineSchema = z.strictObject({
+  /** Entrées maximum exécutées par tick (anti-rafale). Les sorties ne sont pas limitées. */
+  max_entries_per_tick: z.number().int().min(1).max(10).default(1),
 });
 
 const TrailingStopSchema = z.strictObject({
@@ -115,6 +136,8 @@ export const ConfigSchema = z.strictObject({
   strategies: StrategiesSchema.default(StrategiesSchema.parse({})),
   risk: RiskSchema.default(RiskSchema.parse({})),
   execution: ExecutionSchema.default(ExecutionSchema.parse({})),
+  paper: PaperSchema.default(PaperSchema.parse({})),
+  engine: EngineSchema.default(EngineSchema.parse({})),
   notifications: NotificationsSchema.default(NotificationsSchema.parse({})),
   database: DatabaseSchema.default(DatabaseSchema.parse({})),
 });

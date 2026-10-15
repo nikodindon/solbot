@@ -8,6 +8,7 @@ import { doctorCommand } from './cli/doctor.js';
 import { initCommand } from './cli/init.js';
 import { priceCommand } from './cli/price.js';
 import { scanCommand } from './cli/scan.js';
+import { startCommand } from './cli/start.js';
 import { stubCommand } from './cli/stub.js';
 import { swapCommand } from './cli/swap.js';
 import { versionCommand } from './cli/version.js';
@@ -23,7 +24,7 @@ program
   )
   .version(getPackageVersion(), '-v, --version', 'affiche la version');
 
-// Commandes implémentées (Phases 0–2)
+// Commandes implémentées (Phases 0–3)
 program.addCommand(initCommand());
 program.addCommand(doctorCommand());
 program.addCommand(balanceCommand());
@@ -31,10 +32,10 @@ program.addCommand(scanCommand());
 program.addCommand(priceCommand());
 program.addCommand(watchCommand());
 program.addCommand(swapCommand());
+program.addCommand(startCommand());
 program.addCommand(versionCommand());
 
 // Commandes prévues par la roadmap (stubs explicites, voir README → section 13)
-program.addCommand(stubCommand('start', 'Phase 3 — Moteur autonome'));
 program.addCommand(stubCommand('backtest', 'Phase 4 — Backtesting'));
 
 program.showHelpAfterError('(lancez `solbot --help` pour la liste des commandes)');

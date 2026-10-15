@@ -26,7 +26,19 @@ strategies: # chaque stratégie est activable/paramétrable indépendamment
     enabled: true
     weight: 1.0
     timeframe: 15m
-    params: { ema_fast: 12, ema_slow: 26, rsi_period: 14, rsi_entry: 65, atr_stop_mult: 2.0 }
+    # atr_period/breakout_lookback/volume_* : moteur Phase 3 (sortie SL ATR + confirmation volume)
+    params:
+      {
+        ema_fast: 12,
+        ema_slow: 26,
+        rsi_period: 14,
+        rsi_entry: 65,
+        atr_period: 14,
+        atr_stop_mult: 2.0,
+        breakout_lookback: 20,
+        volume_mult: 1.5,
+        volume_lookback: 20,
+      }
   mean_reversion:
     enabled: false
     weight: 1.0
@@ -53,6 +65,13 @@ risk: # le RiskManager a toujours le dernier mot
   min_time_between_trades_s: 300
   max_price_impact_pct: 1.0 # rejet si l'impact estimé dépasse ce seuil
   sol_gas_reserve: 0.05 # SOL intouchable, réservé aux frais
+
+paper: # portefeuille virtuel (modes paper et dry-run)
+  initial_usdc: 1000 # caisse virtuelle de départ (USD)
+  fill_slippage_bps: 20 # slippage modélisé par fill (aller simple)
+
+engine: # moteur autonome (`solbot start`)
+  max_entries_per_tick: 1 # entrées max transmises au risque par tick (anti-rafale)
 
 execution:
   path: meta_aggregator # meta_aggregator (/order+/execute) | router (/build)
