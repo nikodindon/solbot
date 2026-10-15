@@ -1,0 +1,71 @@
+# ──────────────────────────────────────────────────────────────
+# solbot — configuration
+# Copiée vers config/config.yaml par `npm run solbot -- init`.
+# Les valeurs ci-dessous sont les DÉFAUTS recommandés.
+# ──────────────────────────────────────────────────────────────
+
+mode: paper # paper | dry_run | live (live exige confirm_live: true)
+confirm_live: false # garde-fou : doit être true pour autoriser le mode live
+base_currency: USDC # devise de référence pour le NAV et le PnL
+loop_interval_s: 30 # période du tick principal (secondes)
+
+universe: # quels actifs le scanner peut trader
+  category: toptraded # classement source : toporganicscore | toptraded | toptrending
+  interval: 24h # fenêtre du classement : 5m | 1h | 6h | 24h
+  candidate_limit: 100 # candidats demandés à Jupiter avant filtrage
+  verified_only: true # uniquement les tokens vérifiés (Tokens API v2)
+  min_liquidity_usd: 250000
+  min_organic_score: 60 # score "organic" Jupiter : filtre anti-volume artificiel
+  min_age_hours: 24 # évite les tokens < 24 h (frais Jupiter 50 bps + risque rug)
+  blacklist_mints: [] # mints interdits (ex. tokens à problème connus)
+  whitelist_mints: [] # si non vide → univers restreint à cette liste
+  max_watchlist: 40 # taille max de la short-list surveillée
+
+strategies: # chaque stratégie est activable/paramétrable indépendamment
+  momentum:
+    enabled: true
+    weight: 1.0
+    timeframe: 15m
+    params: { ema_fast: 12, ema_slow: 26, rsi_period: 14, rsi_entry: 65, atr_stop_mult: 2.0 }
+  mean_reversion:
+    enabled: false
+    weight: 1.0
+    params: { z_entry: 2.0, z_exit: 0.5, window: 96 }
+  dca_rotation:
+    enabled: false
+    weight: 0.5
+    params: { target_alloc: { SOL: 0.4, USDC: 0.6 }, drift_trigger_pct: 5, topup_usdc: 25 }
+  copy_trade:
+    enabled: false
+    weight: 1.0
+    params: { wallets: [], max_delay_ms: 2000, size_mode: proportional, max_trade_usdc: 50 }
+
+risk: # le RiskManager a toujours le dernier mot
+  max_position_pct: 5 # % du NAV par position
+  max_positions: 6 # nombre max de positions ouvertes simultanément
+  max_asset_exposure_pct: 15 # % du NAV max sur un même actif
+  daily_loss_limit_pct: 3 # perte journalière max → pause automatique 24 h
+  max_drawdown_pct: 15 # drawdown max depuis le pic → kill-switch
+  stop_loss_pct: 8
+  take_profit_pct: 15
+  trailing_stop: { activation_pct: 6, retrace_pct: 3 }
+  max_slippage_bps: 100 # utilisé si execution.slippage n'est pas 'rtse'
+  min_time_between_trades_s: 300
+  max_price_impact_pct: 1.0 # rejet si l'impact estimé dépasse ce seuil
+  sol_gas_reserve: 0.05 # SOL intouchable, réservé aux frais
+
+execution:
+  path: meta_aggregator # meta_aggregator (/order+/execute) | router (/build)
+  slippage: rtse # rtse (recommandé) | <entier en bps>
+  exclude_routers: [] # ex. [jupiterz] pour forcer des frais de gaz classiques
+  retries: 3
+  retry_backoff_ms: 750
+  confirm_timeout_s: 60
+
+notifications:
+  telegram:
+    enabled: false
+    notify_on: [trade, error, daily_report]
+
+database:
+  path: ./data/solbot.sqlite
