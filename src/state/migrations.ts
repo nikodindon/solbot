@@ -54,6 +54,34 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 2,
+    name: 'trades',
+    sql: `
+      CREATE TABLE trades (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        mode                   TEXT NOT NULL,
+        status                 TEXT NOT NULL,
+        signature              TEXT,
+        request_id             TEXT,
+        input_mint             TEXT NOT NULL,
+        output_mint            TEXT NOT NULL,
+        in_amount              TEXT NOT NULL,
+        expected_out_amount    TEXT,
+        out_amount             TEXT,
+        router                 TEXT,
+        fee_bps                INTEGER,
+        fee_mint               TEXT,
+        price_impact           REAL,
+        slippage_bps           INTEGER,
+        realized_slippage_bps  INTEGER,
+        error_code             INTEGER,
+        error_message          TEXT,
+        created_at             INTEGER NOT NULL
+      );
+      CREATE INDEX idx_trades_created_at ON trades (created_at);
+    `,
+  },
 ];
 
 /** Applique les migrations manquantes. Retourne le nombre de migrations appliquées. */

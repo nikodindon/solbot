@@ -231,6 +231,7 @@ npm run solbot -- doctor          # vérifie RPC, clé API, solde, version
 npm run solbot -- scan            # construit la watchlist (univers filtré) → SQLite
 npm run solbot -- price SOL USDC  # prix en direct (Price v3) + paire implicite
 npm run solbot -- watch           # collecte ticks + bougies OHLCV en continu (Ctrl+C)
+npm run solbot -- swap SOL USDC 0.05 --dry-run   # swap simulé : vrai /order + simulation RPC, sans signature
 npm run solbot -- start --paper   # démarre le moteur en mode paper (Phase 3)
 ```
 
@@ -240,6 +241,17 @@ Le mode **paper** est le défaut à l'installation :
 npm run solbot -- start --paper   # simulation complète (mêmes règles, aucun ordre)
 npm run solbot -- start --dry-run # obtient de vrais /order + simulation on-chain, sans signer
 npm run solbot -- start --live    # ⚠ fonds réels — exige confirm_live: true en config
+```
+
+Le swap manuel suit la même logique — `solbot swap` respecte le mode de `config.yaml`, et les
+drapeaux `--dry-run` / `--live` le forcent (le live exige `confirm_live: true` + confirmation) :
+
+```bash
+npm run solbot -- swap SOL USDC 0.05 --dry-run        # citation réelle + simulation, aucun fonds engagé
+npm run solbot -- swap USDC SOL max --dry-run         # vend tout le solde USDC (réserve de gaz conservée pour SOL)
+npm run solbot -- swap BONK USDC 1000 --max-slippage-bps 50
+npm run solbot -- swap USDC SOL 10 --live             # ⚠ fonds réels — confirmation interactive (« oui », timeout 60 s)
+npm run solbot -- swap SOL USDC 0.01 --live --yes     # ⚠ automatisation — pas de confirmation (bots/cron)
 ```
 
 ---
@@ -501,7 +513,7 @@ Sharpe simplifié, et **slippage réalisé vs estimé** (le juge de paix de l'ex
 |---|---|---|---|
 | 0 | v0.1.0 | Fondations : config, wallet, CLI, doctor — ✅ **réalisée** | nul (aucun trade) |
 | 1 | v0.2.0 | Données de marché : Price v3, Tokens v2, SQLite, scan — ✅ **réalisée** | nul |
-| 2 | v0.3.0 | Premier swap : `/order` + `/execute`, dry-run, erreurs | faible (manuel, montants choisis) |
+| 2 | v0.3.0 | Premier swap : `/order` + `/execute`, dry-run, erreurs — ✅ **réalisée** | faible (manuel, montants choisis) |
 | 3 | v0.4.0 | Moteur autonome mono-stratégie + risque complet | réel encadré |
 | 4 | v0.5.0 | Multi-stratégies + backtesting + paper complet | réel encadré |
 | 5 | v0.6.0 | Production 24/7 : Docker, Telegram, métriques, backups | réel encadré |
@@ -543,16 +555,19 @@ tous les cas de configuration invalide couverts par les tests ; aucun secret dan
 client **429-safe** (retry + backoff + respect des headers de rate limit) — vérifié contre l'API Jupiter mainnet réelle.
 **73 tests verts** (dont rate limiter, client HTTP, lots Price v3, filtres d'univers, OHLCV, migrations).
 
-### Phase 2 — Premier swap (v0.3.0)
+### Phase 2 — Premier swap (v0.3.0) — ✅ **réalisée**
 
-- [ ] `Executor` Swap V2 : `/order` (avec `taker` = adresse du wallet) → désérialisation `VersionedTransaction` → signature (partielle si router `jupiterz`) → `/execute` → parsing complet du résultat
-- [ ] Gestion exhaustive des erreurs : codes `/order` (`""` + errorCode) et `/execute` (-1, -2, -3, -1000→-1005, -2000→-2004) avec stratégie par code (re-quote, attente, abandon)
-- [ ] Mode **dry-run** : vrai `/order` + `simulateTransaction`, journalisation sans signature
-- [ ] Journalisation `trades` : signature, mints, montants in/out, `router`, `feeBps`, slippage réalisé (vs `outAmount` attendu)
-- [ ] CLI : `solbot swap <in> <out> <amount> [--dry-run] [--max-slippage-bps N]`
-- [ ] Tests d'intégration contre l'API réelle (marqués `@integration`, désactivés en CI par défaut)
+- [x] `Executor` Swap V2 : `/order` (avec `taker` = adresse du wallet) → désérialisation `VersionedTransaction` → signature (partielle si router `jupiterz`) → `/execute` → parsing complet du résultat
+- [x] Gestion exhaustive des erreurs : codes `/order` (`""` + errorCode) et `/execute` (-1, -2, -3, -1000→-1005, -2000→-2004) avec stratégie par code — re-quote borné par `execution.retries` (backoff `execution.retry_backoff_ms`) ou abandon immédiat — et messages français avec indice actionnable
+- [x] Mode **dry-run** : vrai `/order` + `simulateTransaction` (`sigVerify: false`, blockhash remplacé), journalisation sans signature
+- [x] Journalisation `trades` (migration v2) : signature, mints, montants in/out (texte u64), `router`, `feeBps`/`feeMint`, impact prix, slippage demandé et **réalisé** (vs `outAmount` attendu), codes d'erreur
+- [x] CLI : `solbot swap <entrée> <sortie> <montant|max> [--dry-run] [--live] [--yes] [--max-slippage-bps N]` — garde-fous : plafond `risk.max_slippage_bps`, `confirm_live: true`, confirmation interactive (timeout `execution.confirm_timeout_s`), réserve de gaz respectée par `max`
+- [x] Tests d'intégration contre l'API réelle (`tests/integration/`, désactivés par défaut — `SOLBOT_INTEGRATION=1 npm run test:integration`)
 
-**DoD** : exécution aller-retour USDC→SOL→USDC de 10 USDC sur mainnet, slippage total < 1 %, deux swaps journalisés avec leur signature ; 10 dry-runs consécutifs sans crash ; gestion vérifiée d'un échec provoqué (slippage absurde).
+**DoD** (état au 15/10/2026) : ✅ 10 dry-runs consécutifs sans crash ; ✅ échec provoqué vérifié — fonds
+insuffisants (`errorCode 1`) et slippage au-dessus du plafond, contre l'API mainnet réelle ; ✅ **114 tests**
+(dont le test `@integration`). ⏳ **Reste à valider dès que le wallet est financé** : aller-retour
+USDC→SOL→USDC de 10 USDC, slippage total < 1 %, deux swaps journalisés avec leur signature.
 
 ### Phase 3 — Moteur autonome mono-stratégie (v0.4.0)
 

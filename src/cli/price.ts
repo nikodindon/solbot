@@ -19,15 +19,17 @@ import {
 } from './ui.js';
 
 const BASE58_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const SYMBOL_ALIASES = new Map<string, string>([
-  ['SOL', SOL_MINT],
-  ['WSOL', SOL_MINT],
-  ['USDC', USDC_MINT],
+const SYMBOL_ALIASES = new Map<string, { mint: string; decimals: number }>([
+  ['SOL', { mint: SOL_MINT, decimals: 9 }],
+  ['WSOL', { mint: SOL_MINT, decimals: 9 }],
+  ['USDC', { mint: USDC_MINT, decimals: 6 }],
 ]);
 
 export interface ResolvedAsset {
   mint: string;
   label: string;
+  /** Décimales connues (alias et résultats de recherche) — sinon `undefined`. */
+  decimals?: number;
 }
 
 /** Résout un argument CLI (symbole, nom ou mint) en adresse mint. */
@@ -36,7 +38,9 @@ export async function resolveAsset(tokensApi: TokensApi, input: string): Promise
   const upper = trimmed.toUpperCase();
 
   const alias = SYMBOL_ALIASES.get(upper);
-  if (alias !== undefined) return { mint: alias, label: upper === 'WSOL' ? 'SOL' : upper };
+  if (alias !== undefined) {
+    return { mint: alias.mint, label: upper === 'WSOL' ? 'SOL' : upper, decimals: alias.decimals };
+  }
   if (BASE58_PATTERN.test(trimmed)) return { mint: trimmed, label: shorten(trimmed, 4, 4) };
 
   const results = await tokensApi.search(trimmed);
@@ -46,7 +50,11 @@ export async function resolveAsset(tokensApi: TokensApi, input: string): Promise
       hint: 'Essayez un symbole exact (ex. BONK), un nom, ou une adresse mint complète.',
     });
   }
-  return { mint: exact.id, label: exact.symbol || shorten(exact.id, 4, 4) };
+  return {
+    mint: exact.id,
+    label: exact.symbol || shorten(exact.id, 4, 4),
+    ...(exact.decimals === undefined ? {} : { decimals: exact.decimals }),
+  };
 }
 
 /** Affiche le prix USD (Price v3) des actifs demandés + paire implicite si deux actifs. */

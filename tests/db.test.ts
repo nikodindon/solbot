@@ -19,9 +19,9 @@ function memoryDb() {
 describe('migrations', () => {
   it('applique les migrations une seule fois et_versionne', () => {
     const db = openDatabase(':memory:');
-    expect(runMigrations(db)).toBe(1);
+    expect(runMigrations(db)).toBe(2);
     expect(runMigrations(db)).toBe(0);
-    expect(currentSchemaVersion(db)).toBe(1);
+    expect(currentSchemaVersion(db)).toBe(2);
     expect(currentSchemaVersion(openDatabase(':memory:'))).toBe(0);
     db.close();
   });

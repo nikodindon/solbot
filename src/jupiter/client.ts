@@ -89,12 +89,27 @@ export class JupiterClient {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
+    return this.requestJson('GET', url, path, schema);
+  }
 
+  /** POST JSON + validation zod (mêmes retry/backoff que `getJson`). */
+  async postJson<T>(path: string, schema: z.ZodType<T>, body: unknown): Promise<T> {
+    const url = new URL(`${this.baseUrl}${path}`);
+    return this.requestJson('POST', url, path, schema, body);
+  }
+
+  private async requestJson<T>(
+    method: 'GET' | 'POST',
+    url: URL,
+    endpoint: string,
+    schema: z.ZodType<T>,
+    body?: unknown,
+  ): Promise<T> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= this.retries; attempt++) {
       await this.rateLimiter.acquire();
       try {
-        return await this.requestOnce(url, path, schema);
+        return await this.requestOnce(method, url, endpoint, schema, body);
       } catch (error) {
         lastError = error;
         if (!isRetryable(error) || attempt >= this.retries) break;
@@ -107,7 +122,7 @@ export class JupiterClient {
             : Math.min(backoffMs + jitterMs, 60_000);
 
         this.onRetry?.({
-          endpoint: path,
+          endpoint,
           attempt,
           delayMs,
           ...(error instanceof RetryableHttpError ? { status: error.status } : {}),
@@ -118,17 +133,26 @@ export class JupiterClient {
     }
     throw lastError instanceof Error
       ? lastError
-      : new JupiterApiError(`échec de requête ${path} : ${messageOf(lastError)}`, {
-          endpoint: path,
+      : new JupiterApiError(`échec de requête ${endpoint} : ${messageOf(lastError)}`, {
+          endpoint,
         });
   }
 
-  private async requestOnce<T>(url: URL, endpoint: string, schema: z.ZodType<T>): Promise<T> {
+  private async requestOnce<T>(
+    method: 'GET' | 'POST',
+    url: URL,
+    endpoint: string,
+    schema: z.ZodType<T>,
+    body?: unknown,
+  ): Promise<T> {
     const headers: Record<string, string> = { accept: 'application/json' };
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
+    if (body !== undefined) headers['content-type'] = 'application/json';
 
     const response = await this.fetchImpl(url, {
+      method,
       headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 

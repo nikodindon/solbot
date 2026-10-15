@@ -10,6 +10,9 @@ base_currency: USDC # devise de référence pour le NAV et le PnL
 loop_interval_s: 30 # période du tick principal (secondes)
 
 universe: # quels actifs le scanner peut trader
+  category: toptraded # classement source : toporganicscore | toptraded | toptrending
+  interval: 24h # fenêtre du classement : 5m | 1h | 6h | 24h
+  candidate_limit: 100 # candidats demandés à Jupiter avant filtrage
   verified_only: true # uniquement les tokens vérifiés (Tokens API v2)
   min_liquidity_usd: 250000
   min_organic_score: 60 # score "organic" Jupiter : filtre anti-volume artificiel
