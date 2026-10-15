@@ -438,6 +438,83 @@ describe('Executor — échec /order', () => {
   });
 });
 
+describe('Executor — re-cotation sur échec slippage (Phase 6c)', () => {
+  const SLIPPAGE_FAILURE: ExecuteResponse = {
+    status: 'Failed',
+    code: -1000,
+    error: 'ExceededSlippage',
+    signature: null,
+    totalOutputAmount: null,
+  };
+  const SUCCESS: ExecuteResponse = {
+    status: 'Success',
+    code: 0,
+    signature: 'SIG2',
+    totalOutputAmount: '5123456',
+    error: null,
+  };
+
+  it('élargit la borne configurée après un échec de type slippage', async () => {
+    const db = memoryDb();
+    const { api, orderCalls } = makeSwapApi(
+      [makeOrder({ requestId: 'req-1' }), makeOrder({ requestId: 'req-2' })],
+      [SLIPPAGE_FAILURE, SUCCESS],
+    );
+    const executor = new Executor({
+      swapApi: api,
+      config: testConfig({ slippage: 50, retries: 1 }),
+      signer: makeSigner(),
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(orderCalls.map((call) => call.slippageBps)).toEqual([50, 100]);
+    db.close();
+  });
+
+  it('ne touche pas une borne explicitement fournie par la requête', async () => {
+    const db = memoryDb();
+    const { api, orderCalls } = makeSwapApi(
+      [makeOrder({ requestId: 'req-1' }), makeOrder({ requestId: 'req-2' })],
+      [SLIPPAGE_FAILURE, SUCCESS],
+    );
+    const executor = new Executor({
+      swapApi: api,
+      config: testConfig({ slippage: 50, retries: 1 }),
+      signer: makeSigner(),
+      db,
+    });
+
+    const outcome = await executor.swap({ ...REQUEST, slippageBps: 40 }, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(orderCalls.map((call) => call.slippageBps)).toEqual([40, 40]);
+    db.close();
+  });
+
+  it('laisse RTSE re-coter de lui-même (aucune borne transmise)', async () => {
+    const db = memoryDb();
+    const { api, orderCalls } = makeSwapApi(
+      [makeOrder({ requestId: 'req-1' }), makeOrder({ requestId: 'req-2' })],
+      [SLIPPAGE_FAILURE, SUCCESS],
+    );
+    const executor = new Executor({
+      swapApi: api,
+      config: testConfig({ retries: 1 }),
+      signer: makeSigner(),
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(orderCalls.map((call) => call.slippageBps)).toEqual([undefined, undefined]);
+    db.close();
+  });
+});
+
 describe('computeRealizedSlippageBps', () => {
   it('calcule le slippage réalisé vs outAmount attendu', () => {
     expect(computeRealizedSlippageBps('5123456', '5100000')).toBe(45);

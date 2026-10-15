@@ -4,6 +4,7 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
+import { createPublicKey, verify } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { WalletError } from '../src/utils/errors.js';
 import { createWallet } from '../src/wallet/create.js';
@@ -97,5 +98,28 @@ describe('EnvSigner', () => {
 
     expect(signed).toHaveLength(2);
     expect(signed.every((transaction) => transaction.verifySignatures())).toBe(true);
+  });
+
+  it('signe un message brut en ed25519 valide (transactions v1, Phase 6c)', async () => {
+    const wallet = createWallet();
+    const signer = EnvSigner.fromEnv({ BS58_PRIVATE_KEY: wallet.secretKeyBase58 });
+    const message = new TextEncoder().encode('solbot v1 message de test');
+
+    const signature = await signer.signBytes(message);
+
+    expect(signature).toHaveLength(64);
+    // Vérification croisée via la clé publique SPKI dérivée de l'adresse du wallet.
+    const publicKey = createPublicKey({
+      key: Buffer.concat([
+        Buffer.from('302a300506032b6570032100', 'hex'),
+        Buffer.from(signer.publicKey.toBytes()),
+      ]),
+      format: 'der',
+      type: 'spki',
+    });
+    expect(verify(null, message, publicKey, signature)).toBe(true);
+    expect(verify(null, new TextEncoder().encode('autre message'), publicKey, signature)).toBe(
+      false,
+    );
   });
 });

@@ -123,6 +123,7 @@ export async function runSwap(
               choice: effectiveConfig.execution.router.landing,
               connection: (await connect()).connection,
               apiKey: env.JUPITER_API_KEY,
+              jitoRegion: effectiveConfig.execution.router.jito_region,
             }),
           }
         : {}),

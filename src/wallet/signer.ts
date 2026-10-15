@@ -16,4 +16,11 @@ export interface Signer {
   signTransaction<T extends Transaction | VersionedTransaction>(transaction: T): T;
   /** Signe un lot de transactions (en place) et le retourne. */
   signAllTransactions<T extends Transaction | VersionedTransaction>(transactions: T[]): T[];
+  /**
+   * Signature ed25519 brute d'un message (transactions Solana v1 via
+   * `@solana/kit`, Phase 6c) : web3.js ne sait pas signer les transactions v1.
+   * Optionnel — seuls les signers locaux l'implémentent aujourd'hui ;
+   * `execution.router.transaction_version: 1` l'exige.
+   */
+  signBytes?(message: Uint8Array): Promise<Uint8Array>;
 }

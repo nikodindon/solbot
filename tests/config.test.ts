@@ -116,6 +116,42 @@ describe('parseConfig', () => {
     expect(() => parseConfig({ execution: { slippage: 'rapide' } })).toThrowError(/slippage/);
   });
 
+  it('accepte slippage = adaptive et complète ses réglages (Phase 6c)', () => {
+    const config = parseConfig({ execution: { slippage: 'adaptive' } });
+    expect(config.execution.slippage).toBe('adaptive');
+    expect(config.execution.slippage_adaptive).toEqual({
+      timeframe: '15m',
+      period: 14,
+      multiplier: 1,
+      min_bps: 10,
+      max_bps: 100,
+    });
+    expect(config.execution.slippage_bump_factor).toBe(2);
+    expect(
+      parseConfig({
+        execution: { slippage: 'adaptive', slippage_adaptive: { timeframe: '1h', period: 20 } },
+      }).execution.slippage_adaptive.period,
+    ).toBe(20);
+    expect(() =>
+      parseConfig({ execution: { slippage_adaptive: { timeframe: '2h' } } }),
+    ).toThrowError(/timeframe/);
+  });
+
+  it('valide la version de transaction et la région Jito du routeur (Phase 6c)', () => {
+    expect(parseConfig({}).execution.router.transaction_version).toBe(0);
+    expect(parseConfig({}).execution.router.jito_region).toBe('global');
+    expect(
+      parseConfig({ execution: { router: { transaction_version: 1, jito_region: 'frankfurt' } } })
+        .execution.router,
+    ).toMatchObject({ transaction_version: 1, jito_region: 'frankfurt' });
+    expect(() => parseConfig({ execution: { router: { transaction_version: 2 } } })).toThrowError(
+      /transaction_version/,
+    );
+    expect(() => parseConfig({ execution: { router: { jito_region: 'paris' } } })).toThrowError(
+      /jito_region/,
+    );
+  });
+
   it('accepte une stratégie partielle et complète ses défauts', () => {
     const config = parseConfig({ strategies: { mean_reversion: { enabled: true, weight: 2 } } });
     expect(config.strategies.mean_reversion.enabled).toBe(true);

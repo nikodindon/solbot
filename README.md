@@ -402,7 +402,14 @@ backtest:                  # backtest offline (`solbot backtest`)
 
 execution:
   path: meta_aggregator        # meta_aggregator (/order+/execute) | router (/build) | auto (stats live)
-  slippage: rtse               # rtse (recommandé) | <entier en bps>
+  slippage: rtse               # rtse (recommandé) | adaptive (ATR) | <entier en bps>
+  slippage_adaptive:           # utilisé si slippage: adaptive (Phase 6c)
+    timeframe: 15m             # 1m | 5m | 15m | 1h
+    period: 14                 # bougies moyennées par l'ATR
+    multiplier: 1              # ATR (%) → borne (bps)
+    min_bps: 10                # plancher de la borne
+    max_bps: 100               # plafond (risk.max_slippage_bps reste le garde-fou absolu)
+  slippage_bump_factor: 2      # élargit une borne après échec slippage (1 = désactivé)
   exclude_routers: []          # ex. [jupiterz] pour forcer des frais de gaz classiques
   retries: 3
   retry_backoff_ms: 750
@@ -416,6 +423,8 @@ execution:
     landing: rpc               # rpc (votre nœud) | tx_jup (tip ≥ 0,001 SOL) | jito (bundles)
     tip_lamports: 0            # tip minimal (tx_jup impose 1 000 000 ; jito : conseillé ≥ 1 000 000)
     for_jito_bundle: false     # imposé automatiquement par landing: jito
+    jito_region: global        # global | amsterdam | frankfurt | london | ny | slc | singapore | tokyo (latence)
+    transaction_version: 0     # 0 = v0 (stable) | 1 = v1 SIMD-0385 (expérimental, Phase 6c)
   auto:                        # bascule automatique (path: auto) — Phase 6b
     window_days: 7             # fenêtre glissante des statistiques live
     min_samples: 20            # swaps live minimum par chemin avant de comparer
@@ -602,8 +611,12 @@ GET /swap/v2/build → computeBudgetInstructions + setupInstructions + swapInstr
 - **Reçu réel** : déduit des balances de la transaction confirmée (delta du mint de sortie ; best-effort pour SOL natif, la réconciliation corrige les écarts au démarrage). Les échecs de type « confirmation incertaine » ne sont jamais réessayés en aveugle — vérification de la signature requise.
 - **Télémétrie** : `path`, CU, prix CU, tip, cible de landing et latence en ms sont journalisés dans `trades` (migration v5).
 - **Comparaison A/B + bascule automatique** (Phase 6b) : `solbot paths` compare les deux chemins sur les swaps **live** (taux de landing, slippage moyen, latence moyenne, coût moyen) ; `execution.path: auto` bascule vers le Router **seulement** quand il a assez d'échantillons (min. 20 par défaut) et fait mieux que le Meta-Aggregator au-delà de la marge — sinon le défaut prudent reste le Meta-Aggregator.
+- **Slippage adaptatif** (Phase 6c) — `execution.slippage: adaptive` : la borne (bps) est calculée depuis la volatilité récente de l'actif d'entrée (`ATR` des bougies stockées : `atrPct × 10 000 × multiplier`, bornée par `min_bps`/`max_bps`), avec repli automatique sur RTSE si l'historique est insuffisant. Après un **échec classé « slippage »** (simulation, erreur program 6001/0x1771, `/execute`, rejet on-chain), la borne numérique est élargie (`slippage_bump_factor`, × 2 par défaut) avant la re-cotation — jamais au-delà de `risk.max_slippage_bps`, et jamais pour une borne fournie explicitement en CLI (`--max-slippage-bps`).
+- **Latence** (Phase 6c) : `execution.router.jito_region` envoie les bundles au **Block Engine régional** le plus proche (frankfurt/amsterdam/london en Europe) et la cible d'atterrissage **préchauffe** ses dépendances (comptes de tip Jito, une seule requête partagée avec `prepare`) en parallèle du premier `/build`. Le cache de blockhash est sans objet ici : chaque `/build` fournit un blockhash frais, volontairement conservé.
+- **Transactions Solana v1** (Phase 6c, **expérimental**) — `execution.router.transaction_version: 1` demande à `/build` des transactions **v1** (SIMD-0385, 4 096 octets, jusqu'à 64 comptes **sans tables d'adresses**, budget de calcul porté par la config du message) assemblées et signées via `@solana/kit` v8 (web3.js lit la v1 mais ne sait pas la signer). Le tip Jito et les instructions supplémentaires sont convertis et ajoutés en fin de transaction ; la confirmation lit les reçus v0 comme v1 (`maxSupportedTransactionVersion: 1`). Le chemin `/order` (Meta-Aggregator) reste en v0. Rien n'est activé par défaut ; l'option sera promue après validation en live.
 
-Le chemin Meta-Aggregator reste le défaut. La suite de la Phase 6 (slippage adaptatif ATR, re-quote, latence, transactions v1) est listée en §13.
+La Phase 6 est **complète** (6a/6b/6c) : le chemin Meta-Aggregator reste le défaut et la mesure A/B réelle
+(≥ 200 swaps) reste conditionnée au financement du wallet (§13, DoD).
 
 ---
 
@@ -774,7 +787,7 @@ Règles évaluées à chaque tick, anti-spam par règle (`alerts.cooldown_min`, 
 | 3 | v0.4.0 | Moteur autonome mono-stratégie + risque complet — ✅ **réalisée** | réel encadré |
 | 4 | v0.5.0 | Multi-stratégies + backtesting + paper complet — ✅ **réalisée** | réel encadré |
 | 5 | v0.6.0 | Production 24/7 : Docker, Telegram, métriques, backups — ✅ **réalisée** | réel encadré |
-| 6 | v0.7.0 | Exécution avancée : `/build`, tx.jup.ag, Jito, v1 txs | réel avancé |
+| 6 | v0.7.0 | Exécution avancée : `/build`, tx.jup.ag, Jito, v1 txs — ✅ **réalisée** | réel avancé |
 | 7 | v1.0.0 | Intelligence & extensions : copy-trading, Trigger API, keystore | réel mature |
 
 Chaque phase a une **Definition of Done** mesurable. Une phase ne commence que si la précédente est verte.
@@ -928,15 +941,18 @@ neuf** → 108 911 bougies importées et 6 runs de backtest retrouvés.
 - [x] Landing alternatif **tx.jup.ag** (send-only, JSON-RPC `sendTransaction`, `x-api-key`, tip ≥ 0,001 SOL) et **Jito** (bundles, comptes de tip récupérés dynamiquement, observation du sort du bundle) — `execution.router.landing` ou `solbot swap --landing rpc|tx_jup|jito` *(6b)*
 - [x] **Stats A/B + bascule automatique** : `solbot paths` (taux de landing, slippage, latence, coût moyen par chemin, swaps live) et `execution.path: auto` (prudent : min. 20 échantillons/chemin, marge de 2 points, défaut Meta-Aggregator) *(6b)*
 - [ ] Landing alternatif **tx.jup.ag** : mesure réelle du taux de landing vs `/execute` *(reste à mesurer — financement requis)*
-- [ ] **Slippage adaptatif** : RTSE vs borne fixe selon la volatilité (ATR) ; re-quote intelligent sur échec de type slippage *(sous-étape 6c)*
-- [ ] Support **transactions Solana v1** (SIMD-0385, 4096 bytes, `@solana/kit` v8+) quand la taille de transaction est un facteur limitant *(sous-étape 6c)*
-- [ ] Optimisation latence : choix de la région API (eu-central-1 pour l'Europe), cache de blockhash, parallélisation des appels de préparation *(sous-étape 6c)*
+- [x] **Slippage adaptatif** : RTSE vs borne fixe selon la volatilité (ATR des bougies, bornes `min_bps`/`max_bps`, repli RTSE) ; re-quote intelligent sur échec de type slippage (borne élargie × `slippage_bump_factor`, plafonnée par `risk.max_slippage_bps`, sans jamais toucher une surcharge explicite) *(6c)*
+- [x] Support **transactions Solana v1** (SIMD-0385, 4 096 octets, `@solana/kit` v8, budget sur la config du message, sans ALTs) — opt-in `execution.router.transaction_version: 1`, expérimental jusqu'à validation mainnet *(6c)*
+- [x] Optimisation latence : **région Jito** (`execution.router.jito_region` : frankfurt/amsterdam/london…), **préchauffe** des comptes de tip en parallèle du `/build`, sonde v1 simulée en JSON-RPC direct (pas de re-sérialisation web3.js) ; cache de blockhash écarté à dessein (`/build` fournit un blockhash frais) *(6c)*
 
-🧪 **61 tests Phase 6** (29 en 6a, 32 en 6b) : assemblage Router (limite CU, plafond du prix des CU, ALT, tip,
+🧪 **97 tests Phase 6** (29 en 6a, 32 en 6b, 36 en 6c) : assemblage Router (limite CU, plafond du prix des CU, ALT, tip,
 ordre des instructions), atterrissage et calcul du reçu (`outputAmountFromTransaction`), exécuteur Router
 (dry-run, succès live simulé, re-cotation sur simulation en échec, rejet on-chain, confirmation incertaine,
 `/build` HTTP 400), parsing `/build`, cibles `tx.jup.ag`/Jito (JSON-RPC, classification refus/incertain,
-tip Jito, observation de bundle), tips et bascule `auto`, statistiques par chemin (`collectPathStats`, `pickPath`).
+tip Jito, observation de bundle, région, préchauffe), tips et bascule `auto`, statistiques par chemin
+(`collectPathStats`, `pickPath`), slippage adaptatif (ATR, bougies fermées, bornes, détection 6001/0x1771,
+élargissement), transactions v1 (conversions, budget sur la config, ordre des instructions, signature
+ed25519 vérifiée, repli v0).
 
 **DoD** : A/B mesuré sur ≥ 200 swaps réels : taux de landing, slippage moyen et coût total (frais + tips) documentés par chemin d'exécution ; bascule automatique vers le chemin le plus efficace par type de paire.
 

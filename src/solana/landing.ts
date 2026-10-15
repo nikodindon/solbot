@@ -68,6 +68,12 @@ export interface LandingTarget {
   /** Contrainte de tip de la cible (`undefined` = aucun minimum, la config seule décide). */
   readonly tip?: LandingTipRequirement;
   /**
+   * Pré-chauffe best-effort, lancée en parallèle du premier `/build` (latence) :
+   * ex. récupération des comptes de tip Jito. Ne doit jamais lever — `prepare`
+   * reste la voie de référence.
+   */
+  warmup?(): Promise<void>;
+  /**
    * Instructions à ajouter à la transaction avant signature (ex. virement de
    * tip Jito, dont le compte destinataire est choisi au dernier moment).
    */
@@ -170,7 +176,9 @@ export async function confirmViaRpc(
   );
   const transaction = await connection.getTransaction(signature, {
     commitment: 'confirmed',
-    maxSupportedTransactionVersion: 0,
+    // 1 = plafond « à quelle version maximale je sais lire » : couvre v0 et v1
+    // (Phase 6c) sans changer le résultat pour les transactions v0.
+    maxSupportedTransactionVersion: 1,
   });
   const meta = transaction?.meta ?? null;
   return {
@@ -318,6 +326,21 @@ export class JupiterTxLanding implements LandingTarget {
 export const JITO_BLOCK_ENGINE_URL = 'https://mainnet.block-engine.jito.wtf';
 const JITO_BUNDLES_PATH = '/api/v1/bundles';
 
+/** Régions officielles du Block Engine Jito (+ `global` = mainnet par défaut). */
+export type JitoRegion =
+  'global' | 'amsterdam' | 'frankfurt' | 'london' | 'ny' | 'slc' | 'singapore' | 'tokyo';
+
+/**
+ * URL du Block Engine Jito régional (Phase 6c) : choisir la région la plus
+ * proche du VPS réduit la latence d'envoi du bundle (ex. `frankfurt` en
+ * Europe). `global` = point d'entrée mainnet historique.
+ */
+export function jitoBlockEngineUrl(region: JitoRegion = 'global'): string {
+  return region === 'global'
+    ? JITO_BLOCK_ENGINE_URL
+    : `https://${region}.mainnet.block-engine.jito.wtf`;
+}
+
 export interface JitoLandingOptions {
   connection: Connection;
   fetchImpl?: typeof fetch;
@@ -354,9 +377,18 @@ export class JitoLanding implements LandingTarget {
   readonly name = 'jito';
   /** Planché de sécurité : sous ~1 000 lamports, aucun bundle n'est retenu. */
   readonly tip = { minLamports: 1_000, forJitoBundle: true };
-  private tipAccounts: string[] | null = null;
+  private tipAccountsPromise: Promise<string[]> | null = null;
 
   constructor(private readonly options: JitoLandingOptions) {}
+
+  /**
+   * Pré-charge les comptes de tip pendant que la transaction se construit.
+   * Best-effort : un échec n'est pas propagé (aucun accusé mémorisé), la
+   * prochaine demande (`prepare`) retentera pour de vrai.
+   */
+  async warmup(): Promise<void> {
+    await this.getTipAccounts().catch(() => []);
+  }
 
   /** Virement de tip vers un compte Jito (tiré au hasard pour répartir la charge). */
   async prepare(request: LandingTipPreparation): Promise<TransactionInstruction[]> {
@@ -410,8 +442,17 @@ export class JitoLanding implements LandingTarget {
   }
 
   /** Comptes de tip officiels, récupérés dynamiquement (jamais codés en dur). */
-  async getTipAccounts(): Promise<string[]> {
-    if (this.tipAccounts !== null) return this.tipAccounts;
+  getTipAccounts(): Promise<string[]> {
+    // Promesse mémorisée : `warmup` et `prepare` peuvent la demander en même
+    // temps — un seul aller-retour réseau. Un échec n'est pas mémorisé.
+    this.tipAccountsPromise ??= this.fetchTipAccounts().catch((error: unknown) => {
+      this.tipAccountsPromise = null;
+      throw error;
+    });
+    return this.tipAccountsPromise;
+  }
+
+  private async fetchTipAccounts(): Promise<string[]> {
     const result = await postJsonRpc({
       url: this.bundlesUrl(),
       method: 'getTipAccounts',
@@ -426,8 +467,7 @@ export class JitoLanding implements LandingTarget {
     ) {
       throw new SolbotError('Jito : réponse getTipAccounts invalide');
     }
-    this.tipAccounts = result;
-    return this.tipAccounts;
+    return result;
   }
 
   private bundlesUrl(): string {
@@ -475,6 +515,8 @@ export interface CreateLandingTargetOptions {
   connection: Connection;
   /** Clé API Jupiter (`JUPITER_API_KEY`) — requise pour la cible `tx_jup`. */
   apiKey?: string | undefined;
+  /** Région du Block Engine Jito (Phase 6c, latence) — défaut `global`. */
+  jitoRegion?: JitoRegion | undefined;
   fetchImpl?: typeof fetch;
 }
 
@@ -497,6 +539,7 @@ export function createLandingTarget(options: CreateLandingTargetOptions): Landin
   }
   return new JitoLanding({
     connection: options.connection,
+    baseUrl: jitoBlockEngineUrl(options.jitoRegion),
     ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
   });
 }

@@ -215,6 +215,7 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
                     choice: config.execution.router.landing,
                     connection: (await connection()).connection,
                     apiKey: env.JUPITER_API_KEY,
+                    jitoRegion: config.execution.router.jito_region,
                   }),
                 }
               : {}),

@@ -175,6 +175,20 @@ const RouterSchema = z.strictObject({
   landing: z.enum(['rpc', 'tx_jup', 'jito']).default('rpc'),
   /** Tip taillé pour un bundle Jito (imposé automatiquement si `landing: jito`). */
   for_jito_bundle: z.boolean().default(false),
+  /**
+   * Point d'entrée régional du Block Engine Jito (Phase 6c) : choisissez la
+   * région la plus proche de votre VPS (ex. `frankfurt` ou `amsterdam` en
+   * Europe) pour réduire la latence d'atterrissage. `global` = mainnet Jito.
+   */
+  jito_region: z
+    .enum(['global', 'amsterdam', 'frankfurt', 'london', 'ny', 'slc', 'singapore', 'tokyo'])
+    .default('global'),
+  /**
+   * Version des transactions demandées à `/build` (Phase 6c) : `0` (défaut,
+   * ALTs) ou `1` (SIMD-0385, 4096 octets, sans tables d'adresses — expérimental
+   * jusqu'à validation mainnet ; nécessite un signer local).
+   */
+  transaction_version: z.number().int().min(0).max(1).default(0),
 });
 
 /** Réglages de la bascule automatique de chemin (`execution.path: auto`) — Phase 6b. */
@@ -187,9 +201,40 @@ const AutoPathSchema = z.strictObject({
   rate_margin: z.number().min(0).max(0.5).default(0.02),
 });
 
+/** Réglages du slippage adaptatif (`execution.slippage: adaptive`) — Phase 6c. */
+const AdaptiveSlippageSchema = z.strictObject({
+  /** Timeframe des bougies servant au calcul de l'ATR. */
+  timeframe: z.enum(['1m', '5m', '15m', '1h']).default('15m'),
+  /** Nombre de bougies moyennées par l'ATR (période classique : 14). */
+  period: z.number().int().min(2).max(200).default(14),
+  /** Multiplicateur appliqué à l'ATR (%) pour obtenir la borne (bps). */
+  multiplier: z.number().min(0.1).max(10).default(1),
+  /** Plancher de la borne (bps) — un plancher bas re-cote plus souvent. */
+  min_bps: z.number().int().min(1).max(5000).default(10),
+  /** Plafond de la borne (bps) ; `risk.max_slippage_bps` reste le garde-fou absolu. */
+  max_bps: z.number().int().min(1).max(5000).default(100),
+});
+
 const ExecutionSchema = z.strictObject({
   path: z.enum(['meta_aggregator', 'router', 'auto']).default('meta_aggregator'),
-  slippage: z.union([z.literal('rtse'), z.number().int().min(1).max(5000)]).default('rtse'),
+  /**
+   * Slippage demandé : `rtse` (automatique Jupiter, recommandé), `adaptive`
+   * (borne calculée depuis la volatilité ATR de l'actif d'entrée — repli RTSE
+   * si l'historique est insuffisant) ou un entier en bps. Les bornes
+   * numériques peuvent être élargies automatiquement après un échec de type
+   * slippage (`slippage_bump_factor`), jamais au-delà de
+   * `risk.max_slippage_bps`.
+   */
+  slippage: z
+    .union([z.literal('rtse'), z.literal('adaptive'), z.number().int().min(1).max(5000)])
+    .default('rtse'),
+  /** Paramètres du calcul adaptatif (utilisés si `slippage: adaptive`). */
+  slippage_adaptive: AdaptiveSlippageSchema.default(AdaptiveSlippageSchema.parse({})),
+  /**
+   * Facteur d'élargissement de la borne après un échec « slippage »
+   * (1 = désactivé). Ex. : borne 50 bps, facteur 2 → 100 bps à la re-cotation.
+   */
+  slippage_bump_factor: z.number().min(1).max(10).default(2),
   exclude_routers: z.array(z.enum(['jupiterz', 'dflow', 'okx'])).default([]),
   retries: z.number().int().min(0).max(10).default(3),
   retry_backoff_ms: z.number().int().min(50).max(60_000).default(750),

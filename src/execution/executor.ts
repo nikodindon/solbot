@@ -28,6 +28,13 @@ import {
   buildRouterTransaction,
   computeUnitLimitFromSimulation,
 } from './router.js';
+import { buildRouterTransactionV1 } from './router-v1.js';
+import {
+  adaptiveSlippageBps,
+  bumpedSlippageBps,
+  failureText,
+  isSlippageFailure,
+} from './slippage.js';
 
 export type SwapExecutionMode = 'paper' | 'dry_run' | 'live';
 
@@ -93,6 +100,14 @@ export interface RouterExecutionDetails {
   landing: string | null;
   /** Durée envoi → confirmation (ms) — latence d'atterrissage. */
   landingMs: number | null;
+}
+
+/** Transaction finale du chemin Router, signée et prête à envoyer. */
+interface SignedRouterTransaction {
+  signedTransaction: string;
+  signature: string;
+  blockhash: string;
+  lastValidBlockHeight: number;
 }
 
 /** Simule une transaction base64 (implémentation RPC fournie par le CLI). */
@@ -191,6 +206,44 @@ export class Executor {
     });
   }
 
+  /**
+   * Borne de slippage initiale d'un swap : surcharge de la requête, sinon
+   * configuration. `adaptive` (Phase 6c) calcule une borne depuis la volatilité
+   * ATR des bougies stockées — repli RTSE si l'historique est insuffisant.
+   */
+  private resolveSwapSlippage(request: SwapRequest): number | 'rtse' {
+    if (request.slippageBps !== undefined) return request.slippageBps;
+    const { config, db } = this.options;
+    const configured = config.execution.slippage;
+    if (configured === 'rtse') return 'rtse';
+    if (typeof configured === 'number') return configured;
+    if (db === undefined) return 'rtse';
+    const adaptive = config.execution.slippage_adaptive;
+    return (
+      adaptiveSlippageBps(db, request.inputMint, {
+        timeframe: adaptive.timeframe,
+        period: adaptive.period,
+        multiplier: adaptive.multiplier,
+        minBps: adaptive.min_bps,
+        maxBps: adaptive.max_bps,
+      }) ?? 'rtse'
+    );
+  }
+
+  /**
+   * Élargit une borne numérique après un échec « slippage » (re-cotation
+   * intelligente) : × `slippage_bump_factor`, plafonné par
+   * `risk.max_slippage_bps`. Une borne fournie explicitement dans la requête
+   * (ex. `--max-slippage-bps`) est un choix utilisateur : jamais modifiée.
+   * RTSE re-cote de lui-même — rien à élargir.
+   */
+  private bumpSlippage(current: number | 'rtse', request: SwapRequest): number | 'rtse' {
+    if (request.slippageBps !== undefined || current === 'rtse') return current;
+    const { slippage_bump_factor: factor } = this.options.config.execution;
+    if (factor <= 1) return current;
+    return bumpedSlippageBps(current, factor, this.options.config.risk.max_slippage_bps);
+  }
+
   /** Chemin par défaut : `/order` → (simulation | signature) → `/execute`. */
   private async swapMetaAggregator(
     request: SwapRequest,
@@ -198,9 +251,8 @@ export class Executor {
   ): Promise<SwapOutcome> {
     const { config, signer, simulate, swapApi } = this.options;
 
-    const slippageBps =
-      request.slippageBps ??
-      (typeof config.execution.slippage === 'number' ? config.execution.slippage : undefined);
+    // Borne de slippage (Phase 6c) : numérique (fixe, adaptative ATR…) ou RTSE.
+    let slippageBps = this.resolveSwapSlippage(request);
     const excludeRouters = config.execution.exclude_routers;
     const maxAttempts = Math.max(1, config.execution.retries + 1);
     const attempts: ExecuteAttempt[] = [];
@@ -215,7 +267,7 @@ export class Executor {
         outputMint: request.outputMint,
         amount: request.amountBaseUnits.toString(),
         taker: signer.address,
-        ...(slippageBps === undefined ? {} : { slippageBps }),
+        ...(slippageBps === 'rtse' ? {} : { slippageBps }),
         ...(excludeRouters.length === 0 ? {} : { excludeRouters }),
       });
 
@@ -240,7 +292,7 @@ export class Executor {
 
       if (mode !== 'live') {
         const simulation = await simulate!(order.transaction);
-        const simulationError = simulation.err === null ? null : messageOf(simulation.err);
+        const simulationError = simulation.err === null ? null : failureText(simulation.err);
         const tradeId = this.record(order, request, mode, {
           status: 'simulated',
           errorCode: null,
@@ -306,7 +358,10 @@ export class Executor {
         ...(info.hint === undefined ? {} : { hint: info.hint }),
         code: execute.code,
       };
-      if (info.strategy === 'requote' && attempt < maxAttempts) continue;
+      // Échec de type slippage : on élargit la borne pour la re-cotation.
+      const slippageFailure = isSlippageFailure(execute.error);
+      if (slippageFailure) slippageBps = this.bumpSlippage(slippageBps, request);
+      if ((info.strategy === 'requote' || slippageFailure) && attempt < maxAttempts) continue;
 
       this.record(order, request, mode, {
         status: 'failed',
@@ -336,12 +391,18 @@ export class Executor {
     const forJitoBundle =
       landingTarget?.tip?.forJitoBundle === true || routerConfig.for_jito_bundle;
     const tipLamports = Math.max(routerConfig.tip_lamports, landingTarget?.tip?.minLamports ?? 0);
-    const slippageBps =
-      request.slippageBps ??
-      (typeof config.execution.slippage === 'number' ? config.execution.slippage : undefined);
+    // Borne de slippage (Phase 6c) : numérique (fixe, adaptative ATR…) ou RTSE.
+    let slippageBps = this.resolveSwapSlippage(request);
     const maxAttempts = Math.max(1, config.execution.retries + 1);
     const attempts: ExecuteAttempt[] = [];
     let lastFailure: SwapFailure | null = null;
+
+    // Pré-chauffe de la cible d'atterrissage (ex. comptes de tip Jito) en
+    // parallèle du premier `/build` — best-effort : `prepare` reste la
+    // référence et signalera lui-même un échec réel.
+    if (landingTarget?.warmup !== undefined) {
+      void landingTarget.warmup().catch(() => undefined);
+    }
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (attempt > 1) await sleep(config.execution.retry_backoff_ms);
@@ -354,10 +415,11 @@ export class Executor {
           outputMint: request.outputMint,
           amount: request.amountBaseUnits.toString(),
           taker: signer.address,
-          slippageBps: slippageBps ?? 'rtse',
+          slippageBps,
           computeUnitPricePercentile: routerConfig.compute_unit_price_percentile,
           maxAccounts: routerConfig.max_accounts,
           ...(routerConfig.fast_mode ? { mode: 'fast' as const } : {}),
+          ...(routerConfig.transaction_version === 1 ? { transactionVersion: '1' as const } : {}),
           ...(forJitoBundle ? { forJitoBundle: true } : {}),
           // Pour Jito, le tip est un virement vers un compte Jito ajouté par
           // l'assembleur (`prepare`) : on ne demande pas de tip Jupiter.
@@ -422,17 +484,39 @@ export class Executor {
         landingTarget?.prepare !== undefined && tipLamports > 0
           ? await landingTarget.prepare({ taker: signer.publicKey, lamports: tipLamports })
           : [];
-      const probe = buildRouterTransaction({
-        build,
-        payerKey: signer.publicKey,
-        cuLimit: COMPUTE_UNIT_LIMIT_MAX,
-        additionalInstructions: extraInstructions,
-      });
-      const simulation = await simulate!(serializeTransaction(probe.transaction));
-      const simulationError = simulation.err === null ? null : messageOf(simulation.err);
+      // Transaction v1 uniquement si demandée et confirmée par la réponse
+      // (`/build` force la v1 avec `transactionVersion=1` ; toute autre
+      // réponse retombe prudemment sur l'assemblage v0).
+      const useV1 = routerConfig.transaction_version === 1 && build.transactionVersion === 1;
+      const cuPriceCap =
+        routerConfig.cu_price_cap_microlamports > 0
+          ? { cuPriceCapMicrolamports: routerConfig.cu_price_cap_microlamports }
+          : {};
+      const probeBase64 = useV1
+        ? buildRouterTransactionV1({
+            build,
+            payerAddress: signer.address,
+            cuLimit: COMPUTE_UNIT_LIMIT_MAX,
+            ...cuPriceCap,
+            additionalInstructions: extraInstructions,
+          }).probeBase64
+        : serializeTransaction(
+            buildRouterTransaction({
+              build,
+              payerKey: signer.publicKey,
+              cuLimit: COMPUTE_UNIT_LIMIT_MAX,
+              additionalInstructions: extraInstructions,
+            }).transaction,
+          );
+      const simulation = await simulate!(probeBase64);
+      const simulationError = simulation.err === null ? null : failureText(simulation.err);
 
       if (simulationError !== null && mode === 'live') {
-        // La transaction telle que construite serait rejetée : on re-cote.
+        // La transaction telle que construite serait rejetée : on re-cote, en
+        // élargissant la borne si le refus est un dépassement de slippage.
+        if (isSlippageFailure(simulationError)) {
+          slippageBps = this.bumpSlippage(slippageBps, request);
+        }
         const label = `simulation en échec : ${simulationError}`;
         lastFailure = { kind: 'execute', label, code: ROUTER_CODES.simulation };
         attempts.push({
@@ -469,22 +553,71 @@ export class Executor {
         simulation.unitsConsumed,
         routerConfig.cu_limit_buffer,
       );
-      const finalTransaction = buildRouterTransaction({
-        build,
-        payerKey: signer.publicKey,
-        cuLimit,
-        additionalInstructions: extraInstructions,
-        ...(routerConfig.cu_price_cap_microlamports > 0
-          ? { cuPriceCapMicrolamports: routerConfig.cu_price_cap_microlamports }
-          : {}),
-      });
-      const details: RouterExecutionDetails = {
-        cuLimit,
-        cuPriceMicrolamports: finalTransaction.cuPriceMicrolamports,
-        tipLamports: tipLamports > 0 ? tipLamports : null,
-        landing: null,
-        landingMs: null,
-      };
+      let details: RouterExecutionDetails;
+      /** Signe et sérialise la transaction finale (v0 : web3.js ; v1 : kit). */
+      let finalize: () => Promise<SignedRouterTransaction>;
+      if (useV1) {
+        const assembled = buildRouterTransactionV1({
+          build,
+          payerAddress: signer.address,
+          cuLimit,
+          ...cuPriceCap,
+          additionalInstructions: extraInstructions,
+        });
+        details = {
+          cuLimit: assembled.cuLimit,
+          cuPriceMicrolamports: assembled.cuPriceMicrolamports,
+          tipLamports: tipLamports > 0 ? tipLamports : null,
+          landing: null,
+          landingMs: null,
+        };
+        finalize = async () => {
+          const signBytes = signer.signBytes;
+          if (signBytes === undefined) {
+            throw new SolbotError(
+              'transactions v1 : le signer ne sait pas signer un message brut',
+              {
+                hint: 'Utilisez EnvSigner ou repassez transaction_version à 0 dans config.yaml.',
+              },
+            );
+          }
+          const signed = await assembled.sign((message) => signBytes.call(signer, message));
+          return {
+            signedTransaction: signed.signedBase64,
+            signature: signed.signature,
+            blockhash: assembled.blockhash,
+            lastValidBlockHeight: assembled.lastValidBlockHeight,
+          };
+        };
+      } else {
+        const assembled = buildRouterTransaction({
+          build,
+          payerKey: signer.publicKey,
+          cuLimit,
+          additionalInstructions: extraInstructions,
+          ...cuPriceCap,
+        });
+        details = {
+          cuLimit: assembled.cuLimit,
+          cuPriceMicrolamports: assembled.cuPriceMicrolamports,
+          tipLamports: tipLamports > 0 ? tipLamports : null,
+          landing: null,
+          landingMs: null,
+        };
+        finalize = async () => {
+          signer.signTransaction(assembled.transaction);
+          const [signatureBytes] = assembled.transaction.signatures;
+          if (signatureBytes === undefined) {
+            throw new SolbotError('signature locale manquante après signature de la transaction');
+          }
+          return {
+            signedTransaction: serializeTransaction(assembled.transaction),
+            signature: bs58.encode(signatureBytes),
+            blockhash: assembled.blockhash,
+            lastValidBlockHeight: assembled.lastValidBlockHeight,
+          };
+        };
+      }
       const routerFields = {
         path: 'router' as const,
         cuLimit: details.cuLimit,
@@ -507,24 +640,19 @@ export class Executor {
 
       // 4) Signature puis atterrissage par nos soins.
       const landing = this.options.landing!;
-      signer.signTransaction(finalTransaction.transaction);
-      const [signatureBytes] = finalTransaction.transaction.signatures;
-      if (signatureBytes === undefined) {
-        throw new SolbotError('signature locale manquante après signature de la transaction');
-      }
-      const signedTransaction = serializeTransaction(finalTransaction.transaction);
+      const signed = await finalize();
       const landingContext = {
-        blockhash: finalTransaction.blockhash,
-        lastValidBlockHeight: finalTransaction.lastValidBlockHeight,
+        blockhash: signed.blockhash,
+        lastValidBlockHeight: signed.lastValidBlockHeight,
         outputMint: request.outputMint,
         taker: signer.address,
-        signature: bs58.encode(signatureBytes),
+        signature: signed.signature,
       };
 
       const startedAt = Date.now();
       let sendResult: LandingSendResult;
       try {
-        sendResult = await landing.send(signedTransaction, landingContext);
+        sendResult = await landing.send(signed.signedTransaction, landingContext);
       } catch (error) {
         // Envoi refusé (preflight RPC ou cible d'atterrissage) = jamais soumise
         // → re-cotation sûre. Autre erreur (5xx, timeout) = sort inconnu : on
@@ -609,7 +737,11 @@ export class Executor {
       const chainError = confirmation.err;
       const succeeded = chainError === null || chainError === undefined;
       if (!succeeded) {
-        const label = `transaction rejetée on-chain : ${messageOf(chainError)}`;
+        const label = `transaction rejetée on-chain : ${failureText(chainError)}`;
+        // Rejet de type slippage : on élargit la borne pour la re-cotation.
+        if (isSlippageFailure(label)) {
+          slippageBps = this.bumpSlippage(slippageBps, request);
+        }
         lastFailure = { kind: 'execute', label, code: ROUTER_CODES.landing };
         attempts.push({ attempt, requestId: null, code: ROUTER_CODES.landing, label, signature });
         if (attempt < maxAttempts) continue;

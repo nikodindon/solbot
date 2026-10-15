@@ -7,6 +7,7 @@ import {
   RpcLanding,
   TX_JUP_URL,
   createLandingTarget,
+  jitoBlockEngineUrl,
 } from '../src/solana/landing.js';
 import { SolbotError } from '../src/utils/errors.js';
 
@@ -300,6 +301,36 @@ describe('JitoLanding', () => {
     expect(confirmation.err).toBeNull();
     expect(confirmTransaction).toHaveBeenCalledTimes(1);
   });
+
+  it('warmup pré-charge les comptes de tip sans doublon avec prepare (une seule requête)', async () => {
+    const { landing, calls } = makeLanding(() => jsonResponse({ result: [tipAccount] }));
+
+    // Lancés ensemble, comme l'exécuteur : warmup + premier /build puis prepare.
+    const [instructions] = await Promise.all([
+      landing.prepare({ taker, lamports: 2000 }),
+      landing.warmup(),
+    ]);
+
+    expect(calls).toHaveLength(1);
+    expect(instructions).toHaveLength(1);
+  });
+
+  it('un échec de warmup n’est pas mémorisé : prepare retente et réussit', async () => {
+    let attempt = 0;
+    const { landing, calls } = makeLanding(() => {
+      attempt += 1;
+      return attempt === 1
+        ? new Response('boum', { status: 502 })
+        : jsonResponse({ result: [tipAccount] });
+    });
+
+    await landing.warmup(); // avale l'échec, best-effort
+    const instructions = await landing.prepare({ taker, lamports: 1500 });
+
+    expect(calls).toHaveLength(2);
+    expect(instructions).toHaveLength(1);
+    expect(instructions[0]?.keys[1]?.pubkey.toBase58()).toBe(tipAccount);
+  });
 });
 
 describe('createLandingTarget', () => {
@@ -319,5 +350,26 @@ describe('createLandingTarget', () => {
   it('exige JUPITER_API_KEY pour tx.jup.ag', () => {
     const { connection } = fakeConnection();
     expect(() => createLandingTarget({ choice: 'tx_jup', connection })).toThrow(/JUPITER_API_KEY/);
+  });
+
+  it('choisit le Block Engine Jito régional (latence) sans changer les contraintes', async () => {
+    expect(jitoBlockEngineUrl('global')).toBe('https://mainnet.block-engine.jito.wtf');
+    expect(jitoBlockEngineUrl('frankfurt')).toBe('https://frankfurt.mainnet.block-engine.jito.wtf');
+
+    const tipAccount = Keypair.generate().publicKey.toBase58();
+    const { connection } = fakeConnection();
+    const { impl, calls } = recorder(() => jsonResponse({ result: [tipAccount] }));
+    const landing = createLandingTarget({
+      choice: 'jito',
+      connection,
+      jitoRegion: 'frankfurt',
+      fetchImpl: impl as unknown as typeof fetch,
+    });
+
+    await landing.prepare?.({ taker, lamports: 1000 });
+
+    expect(calls[0]?.url.href).toBe(
+      'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles',
+    );
   });
 });

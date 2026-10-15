@@ -21,11 +21,13 @@ import {
   type OrderResponse,
   type SwapApi,
 } from '../src/jupiter/swap.js';
-import type { LandingConfirmation, LandingTarget } from '../src/solana/landing.js';
+import type { LandingConfirmation, LandingContext, LandingTarget } from '../src/solana/landing.js';
+import { upsertCandles } from '../src/state/market-data.js';
 import { openDatabase } from '../src/state/db.js';
 import { runMigrations } from '../src/state/migrations.js';
 import { getRecentTrades, insertTrade, type TradeRecord } from '../src/state/trades.js';
 import { parseConfig, type Config } from '../src/utils/config.js';
+import { EnvSigner } from '../src/wallet/env-signer.js';
 import type { Signer } from '../src/wallet/signer.js';
 
 const SOL = 'So11111111111111111111111111111111111111112';
@@ -124,20 +126,26 @@ function makeBuildApi(sequence: Array<BuildResponse | Error>): BuildStub {
 
 function makeLanding(
   options: {
-    confirm?: Partial<LandingConfirmation> | Error;
+    confirm?: Partial<LandingConfirmation> | Error | Array<Partial<LandingConfirmation> | Error>;
     tip?: LandingTarget['tip'];
     prepare?: LandingTarget['prepare'];
   } = {},
 ) {
-  const send = vi.fn(async () => ({ signature: 'sig-router-1' }));
+  const send = vi.fn(async (_signedBase64: string, _context: LandingContext) => ({
+    signature: 'sig-router-1',
+  }));
+  let confirmIndex = 0;
   const confirm = vi.fn(async (): Promise<LandingConfirmation> => {
-    if (options.confirm instanceof Error) throw options.confirm;
+    const raw = Array.isArray(options.confirm)
+      ? options.confirm[Math.min(confirmIndex++, options.confirm.length - 1)]
+      : options.confirm;
+    if (raw instanceof Error) throw raw;
     return {
       err: null,
       slot: 123,
       outAmountBaseUnits: '190000000',
       feeLamports: 5000,
-      ...options.confirm,
+      ...raw,
     };
   });
   const landing: LandingTarget = {
@@ -605,5 +613,265 @@ describe('Executor — bascule automatique (path: auto)', () => {
 
     expect(outcome.path).toBe('meta_aggregator');
     expect(orderCalls).toHaveLength(1);
+  });
+});
+
+describe('Executor Router — slippage adaptatif et re-cotation (Phase 6c)', () => {
+  /** Bougies synthétiques : amplitude 0,3 % — ATR → 30 bps. */
+  function seedCandles(db: DatabaseSync): void {
+    upsertCandles(
+      db,
+      Array.from({ length: 16 }, (_, index) => ({
+        mint: SOL,
+        timeframe: '15m' as const,
+        bucketStart: index * 900_000,
+        open: 100,
+        high: 100.15,
+        low: 99.85,
+        close: 100,
+        volumeUsd: 1,
+      })),
+    );
+  }
+
+  it('calcule la borne adaptative depuis les bougies stockées (slippage: adaptive)', async () => {
+    const db = memoryDb();
+    seedCandles(db);
+    const { api, buildCalls } = makeBuildApi([makeBuild()]);
+    const { signer } = makeSigner();
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ slippage: 'adaptive' }),
+      signer,
+      simulate: makeSimulate(),
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'dry_run');
+
+    expect(outcome.status).toBe('simulated');
+    expect(buildCalls[0]?.slippageBps).toBe(30);
+  });
+
+  it('retombe sur RTSE sans historique de bougies suffisant', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuild()]);
+    const { signer } = makeSigner();
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ slippage: 'adaptive' }),
+      signer,
+      simulate: makeSimulate(),
+      db,
+    });
+
+    await executor.swap(REQUEST, 'dry_run');
+    expect(buildCalls[0]?.slippageBps).toBe('rtse');
+  });
+
+  it('élargit la borne après un refus de simulation pour slippage (6001)', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuild(), makeBuild()]);
+    const { signer } = makeSigner();
+    const { landing } = makeLanding();
+    let simulated = 0;
+    const simulate: SimulateTransaction = async () => {
+      simulated += 1;
+      return simulated === 1
+        ? {
+            err: { InstructionError: [3, { Custom: 6001 }] },
+            unitsConsumed: null,
+            logsTail: [],
+          }
+        : { err: null, unitsConsumed: 100_000, logsTail: [] };
+    };
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ slippage: 50, retries: 1 }),
+      signer,
+      simulate,
+      landing,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(buildCalls.map((call) => call.slippageBps)).toEqual([50, 100]);
+  });
+
+  it('élargit la borne après un rejet on-chain pour slippage', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuild(), makeBuild()]);
+    const { signer } = makeSigner();
+    const { landing } = makeLanding({
+      confirm: [{ err: { InstructionError: [3, { Custom: 6001 }] } }, {}],
+    });
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ slippage: 50, retries: 1 }),
+      signer,
+      simulate: makeSimulate(),
+      landing,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(outcome.attempts[0]?.code).toBe(ROUTER_CODES.landing);
+    expect(buildCalls.map((call) => call.slippageBps)).toEqual([50, 100]);
+  });
+
+  it('ne touche jamais une borne explicitement fournie par la requête', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuild(), makeBuild()]);
+    const { signer } = makeSigner();
+    const { landing } = makeLanding();
+    let simulated = 0;
+    const simulate: SimulateTransaction = async () => {
+      simulated += 1;
+      return simulated === 1
+        ? { err: { InstructionError: [3, { Custom: 6001 }] }, unitsConsumed: null, logsTail: [] }
+        : { err: null, unitsConsumed: 100_000, logsTail: [] };
+    };
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ slippage: 50, retries: 1 }),
+      signer,
+      simulate,
+      landing,
+      db,
+    });
+
+    const outcome = await executor.swap({ ...REQUEST, slippageBps: 40 }, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(buildCalls.map((call) => call.slippageBps)).toEqual([40, 40]);
+  });
+});
+
+describe('Executor Router — transactions v1 (Phase 6c)', () => {
+  function makeBuildV1(overrides: Record<string, unknown> = {}): BuildResponse {
+    return makeBuild({
+      transactionVersion: 1,
+      computeUnitPrice: '1000',
+      addressesByLookupTableAddress: {},
+      ...overrides,
+    });
+  }
+
+  it('dry-run : sonde une transaction v1 (budget sur la config du message)', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuildV1()]);
+    const { signer, signCount } = makeSigner();
+    let simulated: string | null = null;
+    const simulate: SimulateTransaction = async (transaction) => {
+      simulated = transaction;
+      return { err: null, unitsConsumed: 100_000, logsTail: [] };
+    };
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ router: { transaction_version: 1 } }),
+      signer,
+      simulate,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'dry_run');
+
+    expect(outcome.status).toBe('simulated');
+    expect(buildCalls[0]?.transactionVersion).toBe('1');
+    expect(signCount()).toBe(0);
+    const parsed = VersionedTransaction.deserialize(Buffer.from(simulated!, 'base64'));
+    expect((parsed.message as { version?: unknown }).version).toBe(1);
+    // La sonde porte la limite maximale (1,4 M CU) : frais = 1000 µlamports/CU × 1,4 M ÷ 1e6.
+    const config = (
+      parsed.message as unknown as {
+        transactionConfig: { computeUnitLimit: number; priorityFee: number };
+      }
+    ).transactionConfig;
+    expect(config.computeUnitLimit).toBe(1_400_000);
+    expect(config.priorityFee).toBe(1400);
+    // La limite journalisée est celle de la transaction finale : 1,2 × 100 000 CU simulés.
+    expect(outcome.router?.cuLimit).toBe(120_000);
+    expect(outcome.router?.cuPriceMicrolamports).toBe(1000);
+  });
+
+  it('live : signe la v1 (ed25519) et l’envoie avec la signature locale', async () => {
+    const db = memoryDb();
+    const { api } = makeBuildApi([makeBuildV1()]);
+    const signer = EnvSigner.fromEnv({ BS58_PRIVATE_KEY: bs58.encode(payer.secretKey) });
+    const { landing, send } = makeLanding();
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ router: { transaction_version: 1 } }),
+      signer,
+      simulate: makeSimulate(),
+      landing,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(outcome.router?.landing).toBe('test');
+    const [sentBase64, context] = send.mock.calls[0]!;
+    const parsed = VersionedTransaction.deserialize(Buffer.from(sentBase64, 'base64'));
+    expect((parsed.message as { version?: unknown }).version).toBe(1);
+    // Transaction finale : limite bufferisée (1,2 × 100 000 CU).
+    const config = (
+      parsed.message as unknown as {
+        transactionConfig: { computeUnitLimit: number; priorityFee: number };
+      }
+    ).transactionConfig;
+    expect(config.computeUnitLimit).toBe(120_000);
+    expect(config.priorityFee).toBe(120);
+    const signatureBytes = parsed.signatures[0]!;
+    expect(context.signature).toBe(bs58.encode(signatureBytes));
+    expect(context.blockhash).toBe('11111111111111111111111111111111');
+    expect(context.lastValidBlockHeight).toBe(123456);
+  });
+
+  it('retombe sur l’assemblage v0 si l’API répond en v0 malgré la config', async () => {
+    const db = memoryDb();
+    // `makeBuild()` par défaut : transactionVersion 0.
+    const { api } = makeBuildApi([makeBuild({ computeUnitPrice: '1000' })]);
+    const { signer } = makeSigner();
+    let simulated: string | null = null;
+    const simulate: SimulateTransaction = async (transaction) => {
+      simulated = transaction;
+      return { err: null, unitsConsumed: 100_000, logsTail: [] };
+    };
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ router: { transaction_version: 1 } }),
+      signer,
+      simulate,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'dry_run');
+
+    expect(outcome.status).toBe('simulated');
+    const parsed = VersionedTransaction.deserialize(Buffer.from(simulated!, 'base64'));
+    expect((parsed.message as { version?: unknown }).version).toBe(0);
+  });
+
+  it('refuse le live v1 avec un signer sans signature brute', async () => {
+    const db = memoryDb();
+    const { api } = makeBuildApi([makeBuildV1()]);
+    const { signer } = makeSigner(); // pas de signBytes
+    const { landing } = makeLanding();
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig({ router: { transaction_version: 1 } }),
+      signer,
+      simulate: makeSimulate(),
+      landing,
+      db,
+    });
+
+    await expect(executor.swap(REQUEST, 'live')).rejects.toThrow(/signer ne sait pas signer/);
   });
 });

@@ -1,3 +1,4 @@
+import { createPrivateKey, sign as cryptoSign, type KeyObject } from 'node:crypto';
 import { Keypair, type Transaction, type VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import type { Env } from '../utils/config.js';
@@ -26,8 +27,13 @@ export function keypairFromSecretKey(encoded: string): Keypair {
   return Keypair.fromSecretKey(decodeSecretKey(encoded));
 }
 
+/** En-tête DER PKCS#8 d'une clé privée Ed25519 réduite à sa graine (RFC 8410). */
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
 /** Signer local basé sur la clé privée du fichier `.env` (Phase 0). */
 export class EnvSigner implements Signer {
+  private privateKey: KeyObject | null = null;
+
   private constructor(private readonly keypair: Keypair) {}
 
   static fromEnv(env: Pick<Env, 'BS58_PRIVATE_KEY'>): EnvSigner {
@@ -58,5 +64,24 @@ export class EnvSigner implements Signer {
 
   signAllTransactions<T extends Transaction | VersionedTransaction>(transactions: T[]): T[] {
     return transactions.map((transaction) => this.signTransaction(transaction));
+  }
+
+  /**
+   * Signature ed25519 brute (transactions v1, Phase 6c) : la graine de la clé
+   * du `.env` est convertie en clé PKCS#8 pour `node:crypto` — aucun secret ne
+   * sort du signer, et aucune dépendance supplémentaire.
+   */
+  async signBytes(message: Uint8Array): Promise<Uint8Array> {
+    this.privateKey ??= createPrivateKey({
+      key: Buffer.concat([
+        ED25519_PKCS8_PREFIX,
+        Buffer.from(this.keypair.secretKey.subarray(0, 32)),
+      ]),
+      format: 'der',
+      type: 'pkcs8',
+    });
+    // Vue sans copie : `node:crypto` accepte tout ArrayBufferView.
+    const bytes = Buffer.from(message.buffer, message.byteOffset, message.byteLength);
+    return new Uint8Array(cryptoSign(null, bytes, this.privateKey));
   }
 }

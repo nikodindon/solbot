@@ -200,11 +200,13 @@ Le mode paper fonctionne sans le moindre centime : c'est la porte d'entrée.
 
 ## Slide 12 — La roadmap : et après ?
 
-- ✅ **Aujourd'hui (v0.6.0)** — moteur multi-stratégies, backtests, mode paper complet, et tout ce
+- ✅ **v0.6.0** — moteur multi-stratégies, backtests, mode paper complet, et tout ce
   qu'il faut pour tourner 24/7 : Docker, notifications et commandes Telegram, métriques de santé,
   sauvegardes automatiques de la base.
-- 🔜 **v0.7.0 — exécution avancée** : chemins d'échange plus efficaces, slippage adaptatif selon la
-  volatilité, envoi de transactions optimisé. Objectif : réduire les coûts par trade.
+- ✅ **v0.7.0 — exécution avancée** : deux chemins d'échange comparés en continu (meta-agrégateur Jupiter
+  vs routeur `/build` assemblé par le bot, avec atterrissage RPC, tx.jup.ag ou bundles Jito), slippage
+  adaptatif selon la volatilité (ATR), re-cotation intelligente en cas de dépassement, choix régional du
+  serveur Jito, et support expérimental des transactions Solana v1 (4 096 octets).
 - 🔭 **v1.0 — intelligence & extensions** : copy-trading (suivre des wallets performants),
   ordres limite et DCA déposés **sur la blockchain** comme filets de sécurité (ils survivent même si
   le bot s'arrête), coffre chiffré pour la clé privée, et un tableau de bord web en lecture seule.

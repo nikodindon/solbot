@@ -95,7 +95,17 @@ backtest: # backtest offline (`solbot backtest`) — rejoue le moteur réel sur 
 
 execution:
   path: meta_aggregator # meta_aggregator (/order+/execute) | router (/build) | auto (bascule sur les stats live — 6b)
-  slippage: rtse # rtse (recommandé) | <entier en bps>
+  # Slippage demandé (Phase 6c) : rtse (recommandé) | adaptive | <entier en bps>.
+  # Un échec « slippage » peut élargir automatiquement une borne numérique
+  # (slippage_bump_factor), jamais au-delà de risk.max_slippage_bps.
+  slippage: rtse
+  slippage_adaptive: # utilisé si slippage: adaptive (volatilité ATR des bougies stockées)
+    timeframe: 15m # 1m | 5m | 15m | 1h
+    period: 14 # nombre de bougies moyennées par l'ATR
+    multiplier: 1 # multiplicateur appliqué à l'ATR (%) pour obtenir la borne (bps)
+    min_bps: 10 # plancher de la borne
+    max_bps: 100 # plafond de la borne (risk.max_slippage_bps reste le garde-fou absolu)
+  slippage_bump_factor: 2 # élargissement après échec slippage (1 = désactivé)
   exclude_routers: [] # ex. [jupiterz] pour forcer des frais de gaz classiques
   retries: 3
   retry_backoff_ms: 750
@@ -109,6 +119,13 @@ execution:
     landing: rpc # rpc (votre nœud) | tx_jup (infra Jupiter, tip ≥ 0,001 SOL) | jito (bundles)
     tip_lamports: 0 # tip minimal (le landing tx_jup impose 1 000 000 = 0,001 SOL ; jito : conseillé ≥ 1 000 000)
     for_jito_bundle: false # imposé automatiquement par landing: jito
+    # Région du Block Engine Jito (latence) : choisissez la plus proche du VPS
+    # (frankfurt/amsterdam/london en Europe, ny/slc/singapore/tokyo ailleurs).
+    jito_region: global
+    # Transactions Solana v1 (SIMD-0385, « 4096 octets ») : 0 = v0 (stable, défaut),
+    # 1 = v1 expérimental (sans tables d'adresses, signable uniquement via le
+    # signer local — voir README §10).
+    transaction_version: 0
   auto: # bascule automatique (path: auto) — Phase 6b
     window_days: 7 # fenêtre glissante des statistiques live
     min_samples: 20 # swaps live minimum par chemin avant de comparer
