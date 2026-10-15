@@ -145,7 +145,7 @@ robustesse progressivement (voir la [roadmap](#13-roadmap-avancée)).
 
 > 💡 Fait méconnu : le path **Meta-Aggregator de Jupiter est RPC-less** — `/order` + `/execute` ne nécessitent
 > aucun nœud RPC. Un RPC Solana reste utile pour **lire les soldes**, reconstruire l'état des positions au
-> démarrage et (en Phase 6) utiliser le path Router avec votre propre envoi de transactions.
+> démarrage et (Phase 6, disponible) utiliser le path Router avec votre propre envoi de transactions.
 
 ---
 
@@ -264,6 +264,7 @@ drapeaux `--dry-run` / `--live` le forcent (le live exige `confirm_live: true` +
 npm run solbot -- swap SOL USDC 0.05 --dry-run        # citation réelle + simulation, aucun fonds engagé
 npm run solbot -- swap USDC SOL max --dry-run         # vend tout le solde USDC (réserve de gaz conservée pour SOL)
 npm run solbot -- swap BONK USDC 1000 --max-slippage-bps 50
+npm run solbot -- swap SOL USDC 0.05 --dry-run --path router   # compare les deux chemins d'exécution (Phase 6)
 npm run solbot -- swap USDC SOL 10 --live             # ⚠ fonds réels — confirmation interactive (« oui », timeout 60 s)
 npm run solbot -- swap SOL USDC 0.01 --live --yes     # ⚠ automatisation — pas de confirmation (bots/cron)
 ```
@@ -404,6 +405,14 @@ execution:
   retries: 3
   retry_backoff_ms: 750
   confirm_timeout_s: 60
+  router:                      # chemin router uniquement (Phase 6)
+    compute_unit_price_percentile: high # medium | high | veryHigh | <bps 0-10000>
+    max_accounts: 64           # plafond de comptes de la route (1-64)
+    fast_mode: false           # true = latence réduite, routage légèrement moins optimal
+    cu_limit_buffer: 1.2       # limite CU = buffer × CU simulés (1-2)
+    cu_price_cap_microlamports: 0 # plafond du prix des CU (0 = pas de plafond)
+    tip_lamports: 0            # tip inclus par /build (1 000 000 = 0,001 SOL)
+    for_jito_bundle: false     # tail le tip pour un bundle Jito (atterrissage Jito — 6b)
 
 notifications:
   telegram:
@@ -567,16 +576,22 @@ Points clés retenus pour l'implémentation :
 - **Frais Jupiter** : 2 bps SOL↔stable, 5 bps LST↔stable, 10 bps paires quelconques, 50 bps tokens < 24 h — inclus dans le devis, suivis dans le PnL.
 - **`totalOutputAmount` vs `outputAmountResult`** : on comptabilise `totalInput/OutputAmount` (reflet réel du wallet) dans le PnL.
 
-### Path avancé : Router (`/build`) — Phase 6
+### Path avancé : Router (`/build`) — implémenté (Phase 6a)
 
-Pour les cas nécessitant un contrôle total (instructions custom, option de landing par `tx.jup.ag` avec tip ≥ 0.001 SOL, simulation CU à 1.2×, `mode=fast` pour latence minimale sur paires connues) :
+Pour un contrôle total (aucun frais Jupiter, landing par nos soins), `execution.path: router` (ou `solbot swap --path router …`) utilise :
 
 ```
 GET /swap/v2/build → computeBudgetInstructions + setupInstructions + swapInstruction + cleanupInstruction + tipInstruction + ALTs
-→ construire la transaction soi-même → simuler → signer → envoyer via son RPC ou tx.jup.ag
+→ assemblage v0 par le bot → simulation (CU) → signature → landing RPC → confirmation on-chain
 ```
 
-Le path Router n'a **aucun frais Jupiter** (routing Metis uniquement, pas de RFQ) mais exige de gérer soi-même CU, priority fees et landing. Le bot vise le Meta-Aggregator par défaut et mesure les deux en Phase 6.
+- **Choix** : `taker` = notre wallet, `slippageBps=rtse` par défaut, `computeUnitPricePercentile`, `maxAccounts`, `mode=fast` optionnel — routage **Metis on-chain uniquement** (pas de RFQ) et **sans frais Jupiter**.
+- **Assemblage** : le bot reconstitue la transaction v0 (limite CU, budget, setup, swap, cleanup, tip, tables d'adresses) à partir des instructions brutes ; le blockhash fourni par le build est conservé.
+- **Simulation** : sonde à 1,4 M de CU pour mesurer la consommation réelle, puis limite finale = `cu_limit_buffer` × CU mesurés (1,2 par défaut, plafonnée à 1,4 M) ; le prix des CU peut être plafonné (`cu_price_cap_microlamports`). La simulation tourne dans tous les modes, y compris en live (elle dimensionne la transaction).
+- **Landing** (live) : envoi via le RPC configuré (`sendRawTransaction` + confirmation par blockhash), puis **reçu réel** déduit des balances de la transaction confirmée (delta du mint de sortie ; best-effort pour SOL natif, la réconciliation corrige les écarts au démarrage). Les échecs de type « confirmation incertaine » ne sont jamais réessayés en aveugle — vérification de la signature requise.
+- **Télémétrie** : `path`, CU, prix CU, tip, cible de landing et latence en ms sont journalisés dans `trades` (migration v5) — base de la comparaison A/B des deux chemins (DoD Phase 6).
+
+Le chemin Meta-Aggregator reste le défaut. La suite de la Phase 6 (atterrissage `tx.jup.ag`/Jito, slippage adaptatif, transactions v1) est listée en §13.
 
 ---
 
@@ -875,14 +890,22 @@ neuf** → 108 911 bougies importées et 6 runs de backtest retrouvés.
 
 ### Phase 6 — Exécution avancée (v0.7.0)
 
-- [ ] Path **Router** (`/build`) en option : assemblage d'instructions, simulation CU (limite = 1.2 × simulation), `computeUnitPricePercentile`, `maxAccounts`, `mode=fast` pour les paires connues
-- [ ] Landing alternatif **tx.jup.ag** (send-only, tip ≥ 0.001 SOL) + comparaison mesurée du taux de landing vs `/execute`
-- [ ] Option **Jito** (bundles, tip account dynamique) pour les sorties urgentes
-- [ ] **Slippage adaptatif** : RTSE vs borne fixe selon la volatilité (ATR) ; re-quote intelligent sur échec de type slippage
-- [ ] Support **transactions Solana v1** (SIMD-0385, 4096 bytes, `@solana/kit` v8+) quand la taille de transaction est un facteur limitant
-- [ ] Optimisation latence : choix de la région API (eu-central-1 pour l'Europe), cache de blockhash, parallélisation des appels de préparation
+- [x] **Path Router (`/build`)** en option : assemblage d'instructions v0, simulation CU (limite = 1,2 × simulation, plafonnée à 1,4 M), `computeUnitPricePercentile`, `maxAccounts`, `mode=fast`, plafond du prix des CU, tip — télémétrie journalisée dans `trades` (migration v5), landing RPC propre avec confirmation et reçu déduit des balances, `solbot swap --path router`
+- [ ] Landing alternatif **tx.jup.ag** (send-only, tip ≥ 0.001 SOL) + comparaison mesurée du taux de landing vs `/execute` *(sous-étape 6b)*
+- [ ] Option **Jito** (bundles, tip account dynamique) pour les sorties urgentes *(sous-étape 6b)*
+- [ ] **Slippage adaptatif** : RTSE vs borne fixe selon la volatilité (ATR) ; re-quote intelligent sur échec de type slippage *(sous-étape 6c)*
+- [ ] Support **transactions Solana v1** (SIMD-0385, 4096 bytes, `@solana/kit` v8+) quand la taille de transaction est un facteur limitant *(sous-étape 6c)*
+- [ ] Optimisation latence : choix de la région API (eu-central-1 pour l'Europe), cache de blockhash, parallélisation des appels de préparation *(sous-étape 6c)*
+
+🧪 **29 tests Phase 6a** : assemblage Router (limite CU, plafond du prix des CU, ALT, tip, ordre des instructions),
+atterrissage et calcul du reçu (`outputAmountFromTransaction`), exécuteur Router (dry-run, succès live simulé,
+re-cotation sur simulation en échec, rejet on-chain, confirmation incertaine, `/build` HTTP 400) et parsing `/build`.
 
 **DoD** : A/B mesuré sur ≥ 200 swaps réels : taux de landing, slippage moyen et coût total (frais + tips) documentés par chemin d'exécution ; bascule automatique vers le chemin le plus efficace par type de paire.
+
+⏳ **Reste dépendant du financement** : la mesure A/B réelle (≥ 200 swaps) exige un wallet financé — en attente,
+comme l'aller-retour de 10 USDC de la Phase 2. En attendant, les deux chemins se comparent en dry-run
+(`solbot swap --path router` vs `--path meta_aggregator`).
 
 ### Phase 7 — Intelligence & extensions (v1.0.0)
 

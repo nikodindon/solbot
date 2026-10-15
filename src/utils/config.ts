@@ -156,6 +156,22 @@ const RiskSchema = z.strictObject({
   sol_gas_reserve: z.number().min(0).default(0.05),
 });
 
+/** Options du chemin Router (`/build`) — Phase 6. */
+const RouterSchema = z.strictObject({
+  compute_unit_price_percentile: z
+    .union([z.enum(['medium', 'high', 'veryHigh']), z.number().int().min(0).max(10_000)])
+    .default('high'),
+  max_accounts: z.number().int().min(1).max(64).default(64),
+  fast_mode: z.boolean().default(false),
+  cu_limit_buffer: z.number().min(1).max(2).default(1.2),
+  /** Plafond du prix des CU en micro-lamports (0 = pas de plafond). */
+  cu_price_cap_microlamports: z.number().int().min(0).default(0),
+  /** Tip ajouté par `/build` en lamports (0 = aucun ; 1 000 000 = 0,001 SOL). */
+  tip_lamports: z.number().int().min(0).default(0),
+  /** Tip taillé pour un bundle Jito (atterrissage Jito prévu en sous-étape 6b). */
+  for_jito_bundle: z.boolean().default(false),
+});
+
 const ExecutionSchema = z.strictObject({
   path: z.enum(['meta_aggregator', 'router']).default('meta_aggregator'),
   slippage: z.union([z.literal('rtse'), z.number().int().min(1).max(5000)]).default('rtse'),
@@ -163,6 +179,7 @@ const ExecutionSchema = z.strictObject({
   retries: z.number().int().min(0).max(10).default(3),
   retry_backoff_ms: z.number().int().min(50).max(60_000).default(750),
   confirm_timeout_s: z.number().int().min(5).max(300).default(60),
+  router: RouterSchema.default(RouterSchema.parse({})),
 });
 
 const TelegramSchema = z.strictObject({

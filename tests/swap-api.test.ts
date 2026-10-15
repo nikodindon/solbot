@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { JupiterClient } from '../src/jupiter/client.js';
 import {
+  buildSwapInstructionError,
   describeExecuteError,
   describeOrderFailure,
   routerLabel,
@@ -255,5 +256,103 @@ describe('routerLabel', () => {
     expect(routerLabel('jupiterz')).toBe('JupiterZ (RFQ)');
     expect(routerLabel('inconnu')).toBe('inconnu');
     expect(routerLabel(undefined)).toBe('—');
+  });
+});
+
+const BUILD_FIXTURE = {
+  inputMint: SOL,
+  outputMint: USDC,
+  inAmount: '50000000',
+  outAmount: '5123456',
+  otherAmountThreshold: '5072221',
+  swapMode: 'ExactIn',
+  slippageBps: 50,
+  priceImpactPct: '0.0015',
+  routePlan: [{ swapInfo: { label: 'Meteora DLMM' }, percent: 100 }],
+  computeBudgetInstructions: [
+    {
+      programId: 'ComputeBudget111111111111111111111111111111',
+      accounts: [],
+      data: 'AwAAAAAAAAA=',
+    },
+  ],
+  setupInstructions: [],
+  swapInstruction: {
+    programId: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+    accounts: [{ pubkey: TAKER, isWritable: true, isSigner: true }],
+    data: 'AQID',
+  },
+  cleanupInstruction: null,
+  otherInstructions: [],
+  tipInstruction: {
+    programId: '11111111111111111111111111111111',
+    accounts: [],
+    data: '',
+  },
+  addressesByLookupTableAddress: null,
+  transactionVersion: 0,
+  blockhashWithMetadata: {
+    blockhash: Array.from({ length: 32 }, () => 0),
+    lastValidBlockHeight: 340123456,
+  },
+};
+
+describe('SwapApi.getBuild', () => {
+  it('construit la requête Router (rtse, percentile, mode, tip) et parse la réponse', async () => {
+    const mock = recorder(() => jsonResponse(BUILD_FIXTURE));
+    const api = makeApi(mock.impl);
+
+    const build = await api.getBuild({
+      inputMint: SOL,
+      outputMint: USDC,
+      amount: '50000000',
+      taker: TAKER,
+      slippageBps: 'rtse',
+      computeUnitPricePercentile: 'high',
+      maxAccounts: 64,
+      mode: 'fast',
+      tipAmount: 1_000_000,
+      forJitoBundle: false,
+    });
+
+    expect(build.outAmount).toBe('5123456');
+    expect(build.priceImpactPct).toBe('0.0015');
+    expect(build.computeBudgetInstructions).toHaveLength(1);
+    expect(buildSwapInstructionError(build.swapInstruction)).toBeNull();
+    expect(build.swapInstruction).toMatchObject({
+      programId: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+    });
+    expect(build.tipInstruction?.programId).toBe('11111111111111111111111111111111');
+    expect(build.blockhashWithMetadata?.lastValidBlockHeight).toBe(340123456);
+    expect(build.blockhashWithMetadata?.blockhash).toHaveLength(32);
+
+    const call = mock.calls[0]!;
+    expect(call.url.pathname).toBe('/swap/v2/build');
+    expect(call.url.searchParams.get('inputMint')).toBe(SOL);
+    expect(call.url.searchParams.get('outputMint')).toBe(USDC);
+    expect(call.url.searchParams.get('amount')).toBe('50000000');
+    expect(call.url.searchParams.get('taker')).toBe(TAKER);
+    expect(call.url.searchParams.get('slippageBps')).toBe('rtse');
+    expect(call.url.searchParams.get('computeUnitPricePercentile')).toBe('high');
+    expect(call.url.searchParams.get('maxAccounts')).toBe('64');
+    expect(call.url.searchParams.get('mode')).toBe('fast');
+    expect(call.url.searchParams.get('tipAmount')).toBe('1000000');
+    expect(call.url.searchParams.get('forJitoBundle')).toBe('false');
+  });
+
+  it('parse un swapInstruction en erreur sans lever, détectable par l’appelant', async () => {
+    const mock = recorder(() =>
+      jsonResponse({ ...BUILD_FIXTURE, swapInstruction: { error: 'no route found' } }),
+    );
+    const api = makeApi(mock.impl);
+
+    const build = await api.getBuild({
+      inputMint: SOL,
+      outputMint: USDC,
+      amount: '1',
+      taker: TAKER,
+    });
+    expect(buildSwapInstructionError(build.swapInstruction)).toBe('no route found');
+    expect(buildSwapInstructionError(undefined)).toBe('réponse /build sans instruction de swap');
   });
 });

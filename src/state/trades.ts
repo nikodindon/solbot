@@ -32,6 +32,18 @@ export interface TradeRecord {
   trigger?: string | null;
   /** Frais modélisés en USD (paper/backtest) — `null` si inconnus (live). */
   feeUsd?: number | null;
+  /** Chemin d'exécution (Phase 6) : meta_aggregator | router. */
+  path?: string | null;
+  /** Limite de compute units fixée (chemin router). */
+  cuLimit?: number | null;
+  /** Prix des compute units en micro-lamports (chemin router). */
+  cuPriceMicrolamports?: number | null;
+  /** Tip inclus dans la transaction, en lamports (chemin router). */
+  tipLamports?: number | null;
+  /** Cible d'atterrissage : rpc, tx_jup, jito… (chemin router). */
+  landing?: string | null;
+  /** Durée envoi → confirmation en ms (chemin router). */
+  landingMs?: number | null;
 }
 
 interface TradeRow {
@@ -57,6 +69,12 @@ interface TradeRow {
   strategy: string | null;
   trigger: string | null;
   fee_usd: number | null;
+  path: string | null;
+  cu_limit: number | null;
+  cu_price_microlamports: number | null;
+  tip_lamports: number | null;
+  landing: string | null;
+  landing_ms: number | null;
 }
 
 /** Journalise une intention de swap. Retourne l'id de la ligne créée. */
@@ -67,8 +85,9 @@ export function insertTrade(db: DatabaseSync, trade: TradeRecord): number {
         (mode, status, signature, request_id, input_mint, output_mint, in_amount,
          expected_out_amount, out_amount, router, fee_bps, fee_mint, price_impact,
          slippage_bps, realized_slippage_bps, error_code, error_message, created_at,
-         strategy, trigger, fee_usd)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         strategy, trigger, fee_usd, path, cu_limit, cu_price_microlamports,
+         tip_lamports, landing, landing_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       trade.mode,
@@ -92,6 +111,12 @@ export function insertTrade(db: DatabaseSync, trade: TradeRecord): number {
       trade.strategy ?? null,
       trade.trigger ?? null,
       trade.feeUsd ?? null,
+      trade.path ?? null,
+      trade.cuLimit ?? null,
+      trade.cuPriceMicrolamports ?? null,
+      trade.tipLamports ?? null,
+      trade.landing ?? null,
+      trade.landingMs ?? null,
     ) as unknown as { lastInsertRowid: number | bigint };
   return Number(result.lastInsertRowid);
 }
@@ -143,5 +168,11 @@ export function getRecentTrades(db: DatabaseSync, limit = 20): Array<TradeRecord
     strategy: row.strategy,
     trigger: row.trigger,
     feeUsd: row.fee_usd,
+    path: row.path,
+    cuLimit: row.cu_limit,
+    cuPriceMicrolamports: row.cu_price_microlamports,
+    tipLamports: row.tip_lamports,
+    landing: row.landing,
+    landingMs: row.landing_ms,
   }));
 }

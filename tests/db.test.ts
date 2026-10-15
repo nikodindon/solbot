@@ -19,14 +19,14 @@ function memoryDb() {
 describe('migrations', () => {
   it('applique les migrations une seule fois et_versionne', () => {
     const db = openDatabase(':memory:');
-    expect(runMigrations(db)).toBe(4);
+    expect(runMigrations(db)).toBe(5);
     expect(runMigrations(db)).toBe(0);
-    expect(currentSchemaVersion(db)).toBe(4);
+    expect(currentSchemaVersion(db)).toBe(5);
     expect(currentSchemaVersion(openDatabase(':memory:'))).toBe(0);
     db.close();
   });
 
-  it('crée les tables du moteur (v3) et de la Phase 4 (v4)', () => {
+  it('crée les tables du moteur (v3), de la Phase 4 (v4) et de la Phase 6 (v5)', () => {
     const db = memoryDb();
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -56,7 +56,19 @@ describe('migrations', () => {
       .prepare('PRAGMA table_info(trades)')
       .all()
       .map((row) => (row as unknown as { name: string }).name);
-    expect(tradeColumns).toEqual(expect.arrayContaining(['strategy', 'trigger', 'fee_usd']));
+    expect(tradeColumns).toEqual(
+      expect.arrayContaining([
+        'strategy',
+        'trigger',
+        'fee_usd',
+        'path',
+        'cu_limit',
+        'cu_price_microlamports',
+        'tip_lamports',
+        'landing',
+        'landing_ms',
+      ]),
+    );
     const positionColumns = db
       .prepare('PRAGMA table_info(positions)')
       .all()

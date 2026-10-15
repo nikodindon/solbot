@@ -416,14 +416,14 @@ describe('Executor — échec /order', () => {
     db.close();
   });
 
-  it('refuse execution.path=router et le montant nul', async () => {
+  it('refuse le chemin router sans simulateur et le montant nul', async () => {
     const { api } = makeSwapApi([makeOrder()], []);
     const executor = new Executor({
       swapApi: api,
       config: parseConfig({ execution: { path: 'router' } }),
       signer: makeSigner(),
     });
-    await expect(executor.swap(REQUEST, 'dry_run')).rejects.toThrowError(/router/);
+    await expect(executor.swap(REQUEST, 'live')).rejects.toThrowError(/Router/);
 
     const executor2 = new Executor({ swapApi: api, config: testConfig(), signer: makeSigner() });
     await expect(

@@ -1,18 +1,31 @@
 import type { DatabaseSync } from 'node:sqlite';
-import { VersionedTransaction } from '@solana/web3.js';
+import { SendTransactionError, VersionedTransaction } from '@solana/web3.js';
+import { JupiterApiError } from '../jupiter/errors.js';
 import {
+  buildSwapInstructionError,
   describeExecuteError,
   describeOrderFailure,
+  type BuildResponse,
   type ExecuteResponse,
   type OrderResponse,
   type SwapApi,
 } from '../jupiter/swap.js';
+import type { LandingConfirmation, LandingTarget } from '../solana/landing.js';
 import { insertTrade, type TradeRecord } from '../state/trades.js';
 import type { Config } from '../utils/config.js';
 import { SolbotError, messageOf } from '../utils/errors.js';
 import type { Signer } from '../wallet/signer.js';
+import {
+  COMPUTE_UNIT_LIMIT_MAX,
+  ROUTER_CODES,
+  buildRouterTransaction,
+  computeUnitLimitFromSimulation,
+} from './router.js';
 
 export type SwapExecutionMode = 'paper' | 'dry_run' | 'live';
+
+/** Chemin d'exécution : Meta-Aggregator managé (`/order`+`/execute`) ou Router (`/build`). */
+export type ExecutionPath = 'meta_aggregator' | 'router';
 
 export interface SwapRequest {
   inputMint: string;
@@ -58,6 +71,21 @@ export interface SwapOutcome {
   realizedSlippageBps: number | null;
   tradeId: number | null;
   failure: SwapFailure | null;
+  /** Chemin d'exécution utilisé (Phase 6 ; toujours renseigné par l'Executor). */
+  path?: ExecutionPath;
+  /** Télémétrie du chemin Router (null sur le chemin Meta-Aggregator). */
+  router?: RouterExecutionDetails | null;
+}
+
+/** Télémétrie du chemin Router — journalisée dans `trades` et affichée par la CLI. */
+export interface RouterExecutionDetails {
+  cuLimit: number | null;
+  cuPriceMicrolamports: number | null;
+  tipLamports: number | null;
+  /** Cible d'atterrissage utilisée (`rpc`, `tx_jup`, `jito`…). */
+  landing: string | null;
+  /** Durée envoi → confirmation (ms) — latence d'atterrissage. */
+  landingMs: number | null;
 }
 
 /** Simule une transaction base64 (implémentation RPC fournie par le CLI). */
@@ -67,8 +95,13 @@ export interface ExecutorOptions {
   swapApi: SwapApi;
   config: Config;
   signer: Signer;
-  /** Requis en paper/dry-run : simule la transaction assemblée, sans signature. */
+  /**
+   * Simule la transaction assemblée, sans signature. Requis en paper/dry-run ;
+   * requis aussi sur le chemin Router (estimation des compute units).
+   */
   simulate?: SimulateTransaction;
+  /** Requis sur le chemin Router en live : envoi + confirmation de la transaction signée. */
+  landing?: LandingTarget;
   /** Journalisation SQLite (absent en test unitaire pur). */
   db?: DatabaseSync;
   /**
@@ -80,7 +113,10 @@ export interface ExecutorOptions {
 }
 
 /**
- * Orchestre un swap Meta-Aggregator : `/order` → (simulation | signature) → `/execute`.
+ * Orchestre un swap selon `execution.path` :
+ * - `meta_aggregator` (défaut) : `/order` → (simulation | signature) → `/execute` ;
+ * - `router` (Phase 6) : `/build` → assemblage v0 → simulation (CU) → signature →
+ *   atterrissage par nos soins (`LandingTarget`), confirmation on-chain.
  *
  * Stratégie d'échec par code `/execute` (voir `EXECUTE_ERRORS`) : `requote`
  * relance un ordre frais tant qu'il reste des tentatives, `abort` s'arrête
@@ -91,13 +127,9 @@ export class Executor {
   constructor(private readonly options: ExecutorOptions) {}
 
   async swap(request: SwapRequest, mode: SwapExecutionMode): Promise<SwapOutcome> {
-    const { config, signer, simulate, swapApi } = this.options;
+    const { config, simulate } = this.options;
+    const path = config.execution.path;
 
-    if (config.execution.path !== 'meta_aggregator') {
-      throw new SolbotError("execution.path = 'router' n'est pas encore implémenté", {
-        hint: "Passez execution.path à 'meta_aggregator' (chemin avancé prévu en Phase 6).",
-      });
-    }
     if (request.inputMint === request.outputMint) {
       throw new SolbotError("Les tokens d'entrée et de sortie sont identiques");
     }
@@ -109,6 +141,31 @@ export class Executor {
         hint: 'Erreur interne — le CLI doit fournir une fonction de simulation.',
       });
     }
+    if (path === 'router' && simulate === undefined) {
+      throw new SolbotError(
+        'Chemin Router : simulation RPC requise pour estimer les compute units',
+        {
+          hint: 'Le CLI doit fournir une fonction de simulation, y compris en live.',
+        },
+      );
+    }
+    if (path === 'router' && mode === 'live' && this.options.landing === undefined) {
+      throw new SolbotError("Chemin Router en live : cible d'atterrissage manquante", {
+        hint: 'Le CLI doit fournir un LandingTarget (ex. RpcLanding).',
+      });
+    }
+
+    return path === 'router'
+      ? this.swapRouter(request, mode)
+      : this.swapMetaAggregator(request, mode);
+  }
+
+  /** Chemin par défaut : `/order` → (simulation | signature) → `/execute`. */
+  private async swapMetaAggregator(
+    request: SwapRequest,
+    mode: SwapExecutionMode,
+  ): Promise<SwapOutcome> {
+    const { config, signer, simulate, swapApi } = this.options;
 
     const slippageBps =
       request.slippageBps ??
@@ -234,6 +291,336 @@ export class Executor {
     });
   }
 
+  /**
+   * Chemin Phase 6 : `/build` → assemblage v0 → simulation (CU) → signature →
+   * atterrissage propre (RPC) → confirmation on-chain et reçu déduit des balances.
+   */
+  private async swapRouter(request: SwapRequest, mode: SwapExecutionMode): Promise<SwapOutcome> {
+    const { config, signer, simulate, swapApi } = this.options;
+    const routerConfig = config.execution.router;
+    const slippageBps =
+      request.slippageBps ??
+      (typeof config.execution.slippage === 'number' ? config.execution.slippage : undefined);
+    const maxAttempts = Math.max(1, config.execution.retries + 1);
+    const attempts: ExecuteAttempt[] = [];
+    let lastFailure: SwapFailure | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (attempt > 1) await sleep(config.execution.retry_backoff_ms);
+
+      // 1) Instructions brutes (routage Metis on-chain, pas de transaction assemblée).
+      let build: BuildResponse;
+      try {
+        build = await swapApi.getBuild({
+          inputMint: request.inputMint,
+          outputMint: request.outputMint,
+          amount: request.amountBaseUnits.toString(),
+          taker: signer.address,
+          slippageBps: slippageBps ?? 'rtse',
+          computeUnitPricePercentile: routerConfig.compute_unit_price_percentile,
+          maxAccounts: routerConfig.max_accounts,
+          ...(routerConfig.fast_mode ? { mode: 'fast' as const } : {}),
+          ...(routerConfig.tip_lamports > 0
+            ? {
+                tipAmount: routerConfig.tip_lamports,
+                forJitoBundle: routerConfig.for_jito_bundle,
+              }
+            : {}),
+        });
+      } catch (error) {
+        // Rien à exécuter : pas de ligne `trades` ; HTTP 400 = pas de route, définitif.
+        const definitive = error instanceof JupiterApiError && error.status === 400;
+        const label = `échec /build : ${messageOf(error)}`;
+        lastFailure = { kind: 'order', label, code: ROUTER_CODES.build };
+        attempts.push({
+          attempt,
+          requestId: null,
+          code: ROUTER_CODES.build,
+          label,
+          signature: null,
+        });
+        if (!definitive && attempt < maxAttempts) continue;
+        return this.outcome(
+          mode,
+          'failed',
+          emptyOrderResponse(),
+          null,
+          null,
+          attempts,
+          null,
+          lastFailure,
+          {
+            path: 'router',
+          },
+        );
+      }
+
+      const order = orderFromBuild(build);
+      const buildError = buildSwapInstructionError(build.swapInstruction);
+      if (buildError !== null) {
+        lastFailure = { kind: 'order', label: buildError, code: ROUTER_CODES.build };
+        attempts.push({
+          attempt,
+          requestId: null,
+          code: ROUTER_CODES.build,
+          label: buildError,
+          signature: null,
+        });
+        const tradeId = this.record(order, request, mode, {
+          status: 'failed',
+          errorCode: ROUTER_CODES.build,
+          errorMessage: buildError,
+          path: 'router',
+        });
+        return this.outcome(mode, 'failed', order, null, null, attempts, tradeId, lastFailure, {
+          path: 'router',
+        });
+      }
+
+      await this.options.onQuote?.(order, attempt);
+
+      // 2) Simulation sonde (limite maximale) : mesure les CU réellement consommés.
+      const probe = buildRouterTransaction({
+        build,
+        payerKey: signer.publicKey,
+        cuLimit: COMPUTE_UNIT_LIMIT_MAX,
+      });
+      const simulation = await simulate!(serializeTransaction(probe.transaction));
+      const simulationError = simulation.err === null ? null : messageOf(simulation.err);
+
+      if (simulationError !== null && mode === 'live') {
+        // La transaction telle que construite serait rejetée : on re-cote.
+        const label = `simulation en échec : ${simulationError}`;
+        lastFailure = { kind: 'execute', label, code: ROUTER_CODES.simulation };
+        attempts.push({
+          attempt,
+          requestId: null,
+          code: ROUTER_CODES.simulation,
+          label,
+          signature: null,
+        });
+        if (attempt < maxAttempts) continue;
+        const tradeId = this.record(order, request, mode, {
+          status: 'failed',
+          errorCode: ROUTER_CODES.simulation,
+          errorMessage: label,
+          path: 'router',
+        });
+        return this.outcome(
+          mode,
+          'failed',
+          order,
+          null,
+          simulation,
+          attempts,
+          tradeId,
+          lastFailure,
+          {
+            path: 'router',
+          },
+        );
+      }
+
+      // 3) Transaction finale : limite = buffer × CU simulés, prix éventuellement plafonné.
+      const cuLimit = computeUnitLimitFromSimulation(
+        simulation.unitsConsumed,
+        routerConfig.cu_limit_buffer,
+      );
+      const finalTransaction = buildRouterTransaction({
+        build,
+        payerKey: signer.publicKey,
+        cuLimit,
+        ...(routerConfig.cu_price_cap_microlamports > 0
+          ? { cuPriceCapMicrolamports: routerConfig.cu_price_cap_microlamports }
+          : {}),
+      });
+      const details: RouterExecutionDetails = {
+        cuLimit,
+        cuPriceMicrolamports: finalTransaction.cuPriceMicrolamports,
+        tipLamports: routerConfig.tip_lamports > 0 ? routerConfig.tip_lamports : null,
+        landing: null,
+        landingMs: null,
+      };
+      const routerFields = {
+        path: 'router' as const,
+        cuLimit: details.cuLimit,
+        cuPriceMicrolamports: details.cuPriceMicrolamports,
+        tipLamports: details.tipLamports,
+      };
+
+      if (mode !== 'live') {
+        const tradeId = this.record(order, request, mode, {
+          status: 'simulated',
+          errorCode: null,
+          errorMessage: simulationError,
+          ...routerFields,
+        });
+        return this.outcome(mode, 'simulated', order, null, simulation, attempts, tradeId, null, {
+          path: 'router',
+          router: details,
+        });
+      }
+
+      // 4) Signature puis atterrissage par nos soins.
+      const landing = this.options.landing!;
+      signer.signTransaction(finalTransaction.transaction);
+      const signedTransaction = serializeTransaction(finalTransaction.transaction);
+      const landingContext = {
+        blockhash: finalTransaction.blockhash,
+        lastValidBlockHeight: finalTransaction.lastValidBlockHeight,
+        outputMint: request.outputMint,
+        taker: signer.address,
+      };
+
+      const startedAt = Date.now();
+      let signature: string;
+      try {
+        ({ signature } = await landing.send(signedTransaction, landingContext));
+      } catch (error) {
+        // Preflight refusé = jamais soumise → re-cotation sûre. Autre erreur =
+        // sort inconnu : on n'enchaîne pas un second envoi à l'aveugle.
+        const preflight = error instanceof SendTransactionError;
+        const label = `envoi refusé : ${messageOf(error)}`;
+        lastFailure = { kind: 'execute', label, code: ROUTER_CODES.send };
+        attempts.push({
+          attempt,
+          requestId: null,
+          code: ROUTER_CODES.send,
+          label,
+          signature: null,
+        });
+        if (preflight && attempt < maxAttempts) continue;
+        const tradeId = this.record(order, request, mode, {
+          status: 'failed',
+          errorCode: ROUTER_CODES.send,
+          errorMessage: label,
+          landing: landing.name,
+          ...routerFields,
+        });
+        return this.outcome(
+          mode,
+          'failed',
+          order,
+          null,
+          simulation,
+          attempts,
+          tradeId,
+          lastFailure,
+          {
+            path: 'router',
+            router: { ...details, landing: landing.name },
+          },
+        );
+      }
+
+      let confirmation: LandingConfirmation;
+      try {
+        confirmation = await landing.confirm(signature, landingContext);
+      } catch (error) {
+        // Timeout/expiration : la transaction peut encore atterrir — jamais de réessai ici.
+        const landingMs = Date.now() - startedAt;
+        const label = `confirmation incertaine : ${messageOf(error)} — vérifiez ${signature} on-chain avant toute action`;
+        lastFailure = { kind: 'execute', label, code: ROUTER_CODES.confirmUnknown };
+        attempts.push({
+          attempt,
+          requestId: null,
+          code: ROUTER_CODES.confirmUnknown,
+          label,
+          signature,
+        });
+        const tradeId = this.record(order, request, mode, {
+          status: 'failed',
+          signature,
+          errorCode: ROUTER_CODES.confirmUnknown,
+          errorMessage: label,
+          landing: landing.name,
+          landingMs,
+          ...routerFields,
+        });
+        return this.outcome(
+          mode,
+          'failed',
+          order,
+          null,
+          simulation,
+          attempts,
+          tradeId,
+          lastFailure,
+          {
+            path: 'router',
+            router: { ...details, landing: landing.name, landingMs },
+          },
+        );
+      }
+      const landingMs = Date.now() - startedAt;
+
+      const chainError = confirmation.err;
+      const succeeded = chainError === null || chainError === undefined;
+      if (!succeeded) {
+        const label = `transaction rejetée on-chain : ${messageOf(chainError)}`;
+        lastFailure = { kind: 'execute', label, code: ROUTER_CODES.landing };
+        attempts.push({ attempt, requestId: null, code: ROUTER_CODES.landing, label, signature });
+        if (attempt < maxAttempts) continue;
+        const tradeId = this.record(order, request, mode, {
+          status: 'failed',
+          signature,
+          errorCode: ROUTER_CODES.landing,
+          errorMessage: label,
+          landing: landing.name,
+          landingMs,
+          ...routerFields,
+        });
+        return this.outcome(
+          mode,
+          'failed',
+          order,
+          null,
+          simulation,
+          attempts,
+          tradeId,
+          lastFailure,
+          {
+            path: 'router',
+            router: { ...details, landing: landing.name, landingMs },
+          },
+        );
+      }
+
+      const outAmount = confirmation.outAmountBaseUnits;
+      const realizedSlippageBps = computeRealizedSlippageBps(order.outAmount, outAmount);
+      const execute: ExecuteResponse = {
+        status: 'Success',
+        signature,
+        code: 0,
+        totalOutputAmount: outAmount,
+        error: null,
+      };
+      attempts.push({ attempt, requestId: null, code: 0, label: 'succès', signature });
+      const tradeId = this.record(order, request, mode, {
+        status: 'success',
+        signature,
+        outAmount,
+        realizedSlippageBps,
+        errorCode: null,
+        errorMessage: null,
+        landing: landing.name,
+        landingMs,
+        ...routerFields,
+      });
+      return this.outcome(mode, 'success', order, execute, simulation, attempts, tradeId, null, {
+        path: 'router',
+        router: { ...details, landing: landing.name, landingMs },
+        signature,
+        realizedSlippageBps,
+      });
+    }
+
+    // Inatteignable (la boucle retourne toujours), garde-fou TypeScript.
+    throw new SolbotError('Échec inattendu : aucune tentative effectuée', {
+      hint: lastFailure?.label ?? 'erreur interne',
+    });
+  }
+
   private record(
     order: OrderResponse,
     request: SwapRequest,
@@ -245,6 +632,12 @@ export class Executor {
       realizedSlippageBps?: number | null;
       errorCode: number | null;
       errorMessage: string | null;
+      path?: ExecutionPath;
+      cuLimit?: number | null;
+      cuPriceMicrolamports?: number | null;
+      tipLamports?: number | null;
+      landing?: string | null;
+      landingMs?: number | null;
     },
   ): number | null {
     const { db } = this.options;
@@ -268,6 +661,12 @@ export class Executor {
       errorCode: overrides.errorCode,
       errorMessage: overrides.errorMessage,
       createdAt: Date.now(),
+      path: overrides.path ?? 'meta_aggregator',
+      cuLimit: overrides.cuLimit ?? null,
+      cuPriceMicrolamports: overrides.cuPriceMicrolamports ?? null,
+      tipLamports: overrides.tipLamports ?? null,
+      landing: overrides.landing ?? null,
+      landingMs: overrides.landingMs ?? null,
     });
   }
 
@@ -280,7 +679,12 @@ export class Executor {
     attempts: ExecuteAttempt[],
     tradeId: number | null,
     failure: SwapFailure | null,
-    extra: { signature?: string | null; realizedSlippageBps?: number | null } = {},
+    extra: {
+      signature?: string | null;
+      realizedSlippageBps?: number | null;
+      path?: ExecutionPath;
+      router?: RouterExecutionDetails | null;
+    } = {},
   ): SwapOutcome {
     return {
       mode,
@@ -293,8 +697,43 @@ export class Executor {
       realizedSlippageBps: extra.realizedSlippageBps ?? null,
       tradeId,
       failure,
+      path: extra.path ?? 'meta_aggregator',
+      router: extra.router ?? null,
     };
   }
+}
+
+/** Sérialise une transaction (signée ou non) en base64, prête pour le RPC. */
+function serializeTransaction(transaction: VersionedTransaction): string {
+  return Buffer.from(transaction.serialize()).toString('base64');
+}
+
+/** Normalise la citation `/build` au format `/order` (le reste du code ne voit pas la différence). */
+function orderFromBuild(build: BuildResponse): OrderResponse {
+  const priceImpactPct =
+    build.priceImpactPct === undefined ? undefined : Number(build.priceImpactPct);
+  return {
+    outAmount: build.outAmount,
+    router: 'metis',
+    feeBps: 0,
+    ...(build.inputMint === undefined ? {} : { inputMint: build.inputMint }),
+    ...(build.outputMint === undefined ? {} : { outputMint: build.outputMint }),
+    ...(build.inAmount === undefined ? {} : { inAmount: build.inAmount }),
+    ...(build.otherAmountThreshold === undefined
+      ? {}
+      : { otherAmountThreshold: build.otherAmountThreshold }),
+    ...(build.swapMode === undefined ? {} : { swapMode: build.swapMode }),
+    ...(build.slippageBps === undefined ? {} : { slippageBps: build.slippageBps }),
+    ...(priceImpactPct === undefined || !Number.isFinite(priceImpactPct)
+      ? {}
+      : { priceImpact: priceImpactPct * 100 }),
+    ...(build.routePlan === undefined ? {} : { routePlan: build.routePlan }),
+  };
+}
+
+/** Citation vide pour les échecs `/build` sans réponse exploitable (pas de ligne `trades`). */
+function emptyOrderResponse(): OrderResponse {
+  return { outAmount: '0' };
 }
 
 /** Slippage réalisé en bps vs `outAmount` attendu (positif = exécution moins bonne). */

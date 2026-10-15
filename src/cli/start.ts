@@ -16,6 +16,7 @@ import { TokensApi } from '../jupiter/tokens.js';
 import { pollOnce } from '../market/poller.js';
 import { Supervisor } from '../monitoring/supervisor.js';
 import { resolveConnection } from '../solana/connection.js';
+import { RpcLanding } from '../solana/landing.js';
 import { buildSimulator } from '../solana/simulate.js';
 import { fetchTokenBalances } from '../solana/tokens.js';
 import { openDatabase, resolveDatabasePath } from '../state/db.js';
@@ -193,6 +194,7 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
     }
 
     // ── Exécuteur (requis en dry-run/live) ─────────────────────────────────
+    const routerPath = config.execution.path === 'router';
     const executor =
       mode === 'paper'
         ? undefined
@@ -201,8 +203,12 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
             config,
             signer,
             db,
-            ...(mode === 'dry_run'
+            // Le chemin Router simule dans tous les modes (estimation des compute units).
+            ...(mode === 'dry_run' || routerPath
               ? { simulate: buildSimulator((await connection()).connection) }
+              : {}),
+            ...(mode === 'live' && routerPath
+              ? { landing: new RpcLanding((await connection()).connection) }
               : {}),
             onQuote: (order) => {
               console.log(

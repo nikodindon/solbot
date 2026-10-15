@@ -8,6 +8,7 @@ import { JupiterClient } from '../jupiter/client.js';
 import { SwapApi, routerLabel, type OrderResponse } from '../jupiter/swap.js';
 import { TokensApi } from '../jupiter/tokens.js';
 import { resolveConnection } from '../solana/connection.js';
+import { RpcLanding } from '../solana/landing.js';
 import { buildSimulator } from '../solana/simulate.js';
 import { fetchTokenBalances } from '../solana/tokens.js';
 import { openDatabase, resolveDatabasePath } from '../state/db.js';
@@ -34,6 +35,8 @@ export interface SwapCliOptions {
   yes?: boolean;
   maxSlippageBps?: string;
   root?: string;
+  /** Surcharge ponctuelle du chemin d'exécution (`meta_aggregator` | `router`). */
+  path?: string;
 }
 
 interface SwapAsset extends ResolvedAsset {
@@ -60,6 +63,7 @@ export async function runSwap(
 
   const mode = resolveMode(options, config);
   const slippageBps = resolveSlippageBps(options, config);
+  const effectiveConfig = applyPathOverride(config, options.path);
 
   const signer = EnvSigner.fromEnv(env);
   const client = new JupiterClient({ apiKey: env.JUPITER_API_KEY, ratePerSecond: env.JUPITER_RPS });
@@ -85,7 +89,10 @@ export async function runSwap(
   runMigrations(db);
 
   try {
-    const simulate = mode === 'live' ? undefined : buildSimulator((await connect()).connection);
+    const routerPath = effectiveConfig.execution.path === 'router';
+    // Le chemin Router simule aussi en live (estimation des compute units).
+    const simulate =
+      mode !== 'live' || routerPath ? buildSimulator((await connect()).connection) : undefined;
 
     if (mode === 'live') {
       await confirmLivePlannedSwap({
@@ -93,7 +100,7 @@ export async function runSwap(
         outputAsset,
         amountBaseUnits,
         slippageBps,
-        config,
+        config: effectiveConfig,
         yes: options.yes === true,
         signer: signer.address,
       });
@@ -101,9 +108,12 @@ export async function runSwap(
 
     const executor = new Executor({
       swapApi,
-      config,
+      config: effectiveConfig,
       signer,
       ...(simulate === undefined ? {} : { simulate }),
+      ...(mode === 'live' && routerPath
+        ? { landing: new RpcLanding((await connect()).connection) }
+        : {}),
       db,
       onQuote: mode === 'live' ? printLiveQuote : undefined,
     });
@@ -154,6 +164,17 @@ function resolveSlippageBps(options: SwapCliOptions, config: Config): number | u
     );
   }
   return bps;
+}
+
+/** `--path` : surcharge ponctuelle du chemin d'exécution (comparaison meta-aggregator vs router). */
+function applyPathOverride(config: Config, path: string | undefined): Config {
+  if (path === undefined) return config;
+  if (path === 'meta_aggregator' || path === 'router') {
+    return { ...config, execution: { ...config.execution, path } };
+  }
+  throw new SolbotError(`Chemin d'exécution inconnu « ${path} »`, {
+    hint: 'Valeurs acceptées : meta_aggregator, router.',
+  });
 }
 
 /** Connexion RPC paresseuse et mémorisée (le mode live sans « max » n'en a pas besoin). */
@@ -324,6 +345,18 @@ function printSwapReport(
     console.log('  Slippage    RTSE (automatique Jupiter)');
   }
 
+  if (outcome.path === 'router' && outcome.router !== null && outcome.router !== undefined) {
+    const r = outcome.router;
+    const parts = ['router (/build)'];
+    if (r.cuLimit !== null) parts.push(`CU ${r.cuLimit.toLocaleString('fr-FR')}`);
+    if (r.cuPriceMicrolamports !== null) parts.push(`prix CU ${r.cuPriceMicrolamports} µlamports`);
+    if (r.tipLamports !== null) parts.push(`tip ${r.tipLamports} lamports`);
+    if (r.landing !== null) {
+      parts.push(`atterrissage ${r.landing}${r.landingMs !== null ? ` (${r.landingMs} ms)` : ''}`);
+    }
+    console.log(`  Chemin      ${parts.join(' · ')}`);
+  }
+
   if (outcome.status === 'simulated' && outcome.simulation !== null) {
     const { err, unitsConsumed, logsTail } = outcome.simulation;
     if (err === null) {
@@ -338,7 +371,11 @@ function printSwapReport(
   }
 
   if (outcome.status === 'success') {
-    console.log(`\n  ${ICONS.ok} Swap exécuté et confirmé par Jupiter`);
+    const confirmedBy =
+      outcome.path === 'router'
+        ? `confirmé on-chain (atterrissage ${outcome.router?.landing ?? 'rpc'})`
+        : 'confirmé par Jupiter';
+    console.log(`\n  ${ICONS.ok} Swap exécuté et ${confirmedBy}`);
     if (outcome.signature !== null) {
       console.log(`      signature : ${outcome.signature}`);
       console.log(`      https://solscan.io/tx/${outcome.signature}`);
@@ -362,9 +399,15 @@ function printSwapReport(
   }
 
   if (outcome.status === 'failed' && outcome.failure !== null) {
-    console.log(
-      `\n  ${ICONS.fail} Échec (${outcome.failure.kind === 'order' ? '/order' : '/execute'}) : ${outcome.failure.label}`,
-    );
+    const source =
+      outcome.path === 'router'
+        ? outcome.failure.kind === 'order'
+          ? '/build'
+          : 'atterrissage'
+        : outcome.failure.kind === 'order'
+          ? '/order'
+          : '/execute';
+    console.log(`\n  ${ICONS.fail} Échec (${source}) : ${outcome.failure.label}`);
     if (outcome.failure.code !== null) console.log(`      code ${outcome.failure.code}`);
     if (outcome.failure.hint !== undefined) console.log(`      → ${outcome.failure.hint}`);
   }
@@ -395,12 +438,22 @@ export function swapCommand(): Command {
     .option('--live', 'swap réel — exige confirm_live: true et une confirmation (ou --yes)')
     .option('--yes', 'confirme automatiquement le swap live (automatisation, dangereux)')
     .option('--max-slippage-bps <n>', 'slippage max en bps (plafonné par risk.max_slippage_bps)')
+    .option(
+      '--path <chemin>',
+      'chemin d’exécution : meta_aggregator ou router (défaut : config.yaml)',
+    )
     .action(
       async (
         input: string,
         output: string,
         amount: string,
-        options: { dryRun?: boolean; live?: boolean; yes?: boolean; maxSlippageBps?: string },
+        options: {
+          dryRun?: boolean;
+          live?: boolean;
+          yes?: boolean;
+          maxSlippageBps?: string;
+          path?: string;
+        },
       ) => {
         try {
           const outcome = await runSwap(input, output, amount, {
@@ -410,6 +463,7 @@ export function swapCommand(): Command {
             ...(options.maxSlippageBps === undefined
               ? {}
               : { maxSlippageBps: options.maxSlippageBps }),
+            ...(options.path === undefined ? {} : { path: options.path }),
           });
           process.exitCode = swapExitCode(outcome);
         } catch (error) {

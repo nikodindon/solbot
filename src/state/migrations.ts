@@ -257,6 +257,19 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE positions ADD COLUMN mode TEXT;
     `,
   },
+  {
+    version: 5,
+    name: 'phase6_router_execution',
+    sql: `
+      -- Chemin d'exécution (meta_aggregator | router) et télémétrie du landing (Phase 6).
+      ALTER TABLE trades ADD COLUMN path TEXT;
+      ALTER TABLE trades ADD COLUMN cu_limit INTEGER;
+      ALTER TABLE trades ADD COLUMN cu_price_microlamports INTEGER;
+      ALTER TABLE trades ADD COLUMN tip_lamports INTEGER;
+      ALTER TABLE trades ADD COLUMN landing TEXT;
+      ALTER TABLE trades ADD COLUMN landing_ms INTEGER;
+    `,
+  },
 ];
 
 /** Applique les migrations manquantes. Retourne le nombre de migrations appliquées. */

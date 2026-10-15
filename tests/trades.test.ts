@@ -32,6 +32,12 @@ function record(overrides: Partial<TradeRecord> = {}): TradeRecord {
     createdAt: 1_000,
     strategy: 'momentum',
     trigger: 'entry',
+    path: 'router',
+    cuLimit: 120_000,
+    cuPriceMicrolamports: 10_000,
+    tipLamports: null,
+    landing: 'rpc',
+    landingMs: 42,
     ...overrides,
   };
 }

@@ -92,6 +92,82 @@ export const ExecuteResponseSchema = z
 export type ExecuteResponse = z.infer<typeof ExecuteResponseSchema>;
 
 /* ──────────────────────────────────────────────────────────────
+ * Schémas — Router path (`GET /swap/v2/build`)
+ * ────────────────────────────────────────────────────────────── */
+
+const AccountMetaSchema = z.object({
+  pubkey: z.string(),
+  isWritable: z.boolean(),
+  isSigner: z.boolean(),
+});
+
+/** Instruction brute (base64) renvoyée par `/build` — assemblée par nos soins. */
+export const ApiInstructionSchema = z.object({
+  programId: z.string(),
+  accounts: z.array(AccountMetaSchema),
+  data: z.string(),
+});
+
+export type ApiInstruction = z.infer<typeof ApiInstructionSchema>;
+
+/** `swapInstruction` porte `{ error }` quand aucune route exploitable n'existe. */
+export type BuildSwapInstruction = ApiInstruction | { error: string };
+
+/** Blockhash fourni par `/build` (octets + validité) — l'envoi reste à notre charge. */
+export const BlockhashWithMetadataSchema = z.object({
+  blockhash: z.array(z.number().int().min(0).max(255)),
+  lastValidBlockHeight: z.number(),
+  fetchedAt: z.object({ secs_since_epoch: z.number(), nanos_since_epoch: z.number() }).optional(),
+});
+
+export type BlockhashWithMetadata = z.infer<typeof BlockhashWithMetadataSchema>;
+
+/**
+ * Réponse de `GET /swap/v2/build`. Schéma tolérant (`passthrough`) : l'API V2
+ * évolue, seuls les champs essentiels au flux sont validés.
+ */
+export const BuildResponseSchema = z
+  .object({
+    inputMint: z.string().optional(),
+    outputMint: z.string().optional(),
+    inAmount: z.string().optional(),
+    outAmount: z.string().default('0'),
+    otherAmountThreshold: z.string().optional(),
+    swapMode: z.string().optional(),
+    slippageBps: z.number().optional(),
+    /** Ratio décimal (« 0.001 » = 0,1 %) — converti en % par l'exécuteur. */
+    priceImpactPct: z.string().optional(),
+    routePlan: z.array(RoutePlanStepSchema).optional(),
+    computeBudgetInstructions: z.array(ApiInstructionSchema).default([]),
+    setupInstructions: z.array(ApiInstructionSchema).default([]),
+    swapInstruction: z
+      .union([ApiInstructionSchema, z.object({ error: z.string() })])
+      .nullable()
+      .optional(),
+    cleanupInstruction: ApiInstructionSchema.nullable().optional(),
+    otherInstructions: z.array(ApiInstructionSchema).default([]),
+    tipInstruction: ApiInstructionSchema.nullable().optional(),
+    addressesByLookupTableAddress: z.record(z.string(), z.array(z.string())).nullable().optional(),
+    computeUnitPrice: z.string().optional(),
+    transactionVersion: z.number().optional(),
+    blockhashWithMetadata: BlockhashWithMetadataSchema.optional(),
+  })
+  .passthrough();
+
+export type BuildResponse = z.infer<typeof BuildResponseSchema>;
+
+/** Extrait l'erreur de `swapInstruction` (null si l'instruction est exploitable). */
+export function buildSwapInstructionError(
+  swapInstruction: BuildSwapInstruction | null | undefined,
+): string | null {
+  if (swapInstruction === null || swapInstruction === undefined) {
+    return 'réponse /build sans instruction de swap';
+  }
+  if ('error' in swapInstruction) return swapInstruction.error;
+  return null;
+}
+
+/* ──────────────────────────────────────────────────────────────
  * Paramètres /order
  * ────────────────────────────────────────────────────────────── */
 
@@ -110,6 +186,32 @@ export interface OrderParams {
   maxSupportedTransactionVersion?: '0' | '1';
   priorityFeeLamports?: number;
   jitoTipLamports?: number;
+}
+
+/* ──────────────────────────────────────────────────────────────
+ * Paramètres /build (Router path)
+ * ────────────────────────────────────────────────────────────── */
+
+export interface BuildParams {
+  inputMint: string;
+  outputMint: string;
+  /** Montant en unités de base (smallest unit) du token d'entrée. */
+  amount: string;
+  /** Adresse qui paiera et signera (nos swaps sont auto-financés : taker = payeur). */
+  taker: string;
+  /** Bps de slippage (0–10000), ou `'rtse'` pour le slippage automatique Jupiter. */
+  slippageBps?: number | 'rtse';
+  /** Cherté des compute units : percentile nommé ou bps (0–10000). */
+  computeUnitPricePercentile?: 'medium' | 'high' | 'veryHigh' | number;
+  /** Plafonne le nombre de comptes de la route (transaction plus compacte). */
+  maxAccounts?: number;
+  /** `fast` : latence réduite, routage légèrement moins optimal. */
+  mode?: 'fast';
+  /** Tip en lamports (≥ 1 000 000 pour l'infra d'atterrissage Jupiter) — ajoute `tipInstruction`. */
+  tipAmount?: number;
+  /** Tip taillé pour un bundle Jito (atterrissage Jito — Phase 6b). */
+  forJitoBundle?: boolean;
+  transactionVersion?: '0' | '1';
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -234,6 +336,23 @@ export class SwapApi {
       maxSupportedTransactionVersion: params.maxSupportedTransactionVersion,
       priorityFeeLamports: params.priorityFeeLamports,
       jitoTipLamports: params.jitoTipLamports,
+    });
+  }
+
+  /** Instructions brutes de swap (Router path, Phase 6) — assemblage et envoi à notre charge. */
+  getBuild(params: BuildParams): Promise<BuildResponse> {
+    return this.client.getJson('/swap/v2/build', BuildResponseSchema, {
+      inputMint: params.inputMint,
+      outputMint: params.outputMint,
+      amount: params.amount,
+      taker: params.taker,
+      slippageBps: params.slippageBps,
+      computeUnitPricePercentile: params.computeUnitPricePercentile,
+      maxAccounts: params.maxAccounts,
+      mode: params.mode,
+      tipAmount: params.tipAmount,
+      forJitoBundle: params.forJitoBundle,
+      transactionVersion: params.transactionVersion,
     });
   }
 

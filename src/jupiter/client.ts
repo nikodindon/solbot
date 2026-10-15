@@ -83,7 +83,7 @@ export class JupiterClient {
   async getJson<T>(
     path: string,
     schema: z.ZodType<T>,
-    params: Record<string, string | number | undefined> = {},
+    params: Record<string, string | number | boolean | undefined> = {},
   ): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     for (const [key, value] of Object.entries(params)) {
