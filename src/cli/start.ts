@@ -14,6 +14,7 @@ import { PriceApi } from '../jupiter/price.js';
 import { SwapApi } from '../jupiter/swap.js';
 import { TokensApi } from '../jupiter/tokens.js';
 import { pollOnce } from '../market/poller.js';
+import { Supervisor } from '../monitoring/supervisor.js';
 import { resolveConnection } from '../solana/connection.js';
 import { buildSimulator } from '../solana/simulate.js';
 import { fetchTokenBalances } from '../solana/tokens.js';
@@ -26,6 +27,7 @@ import { resolveUniverse } from '../universe/builder.js';
 import { loadConfig, parseEnv, type Config } from '../utils/config.js';
 import { loadEnvFile } from '../utils/env-file.js';
 import { SolbotError } from '../utils/errors.js';
+import { getPackageVersion } from '../utils/package.js';
 import { getProjectRoot } from '../utils/paths.js';
 import { EnvSigner } from '../wallet/env-signer.js';
 import { fail, ICONS, parseIntOption, printHeader, shorten } from './ui.js';
@@ -94,6 +96,18 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
   const signer = EnvSigner.fromEnv(env);
   const base = config.base_currency === 'SOL' ? SOL_MINT : USDC_MINT;
   const stopPath = path.join(root, 'STOP');
+  const stopFile = {
+    exists: () => fs.existsSync(stopPath),
+    createIfAbsent: (): void => {
+      try {
+        fs.writeFileSync(stopPath, `Kill-switch déclenché le ${new Date().toISOString()}\n`, {
+          flag: 'wx',
+        });
+      } catch {
+        // Le fichier existe déjà — rien à faire.
+      }
+    },
+  };
 
   let connect: (() => ReturnType<typeof resolveConnection>) | null = null;
   const connection = (): ReturnType<typeof resolveConnection> => {
@@ -110,7 +124,23 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
     });
   }
 
+  // ── Supervision (Phase 5) : métriques, healthcheck, Telegram, alertes, backups ──
+  let engineRef: Engine | null = null;
+  const supervisor = new Supervisor({
+    root,
+    db,
+    config,
+    mode,
+    env,
+    version: getPackageVersion(),
+    stopFile,
+    stopRequested: () => engineRef?.stopping === true,
+    intervalS: options.interval ?? config.loop_interval_s,
+    onLog: (line) => console.log(`  ${ICONS.warn} ${line}`),
+  });
+
   try {
+    const supervision = await supervisor.start();
     // ── Réconciliation on-chain (live uniquement : la chaîne fait foi) ─────
     if (mode === 'live') {
       const { connection: rpc } = await connection();
@@ -155,6 +185,11 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
       console.log(
         `  ${ICONS.ok} réconciliation : ${reconcile.adopted.length} adoptée(s), ${reconcile.adjusted.length} ajustée(s), ${reconcile.closed.length} clôturée(s)${reconcile.skipped.length > 0 ? `, ${reconcile.skipped.length} ignorée(s)` : ''}${actions === 0 ? ' — rien à faire' : ''}`,
       );
+      supervisor.onReconcile({
+        adopted: reconcile.adopted.length,
+        adjusted: reconcile.adjusted.length,
+        closed: reconcile.closed.length,
+      });
     }
 
     // ── Exécuteur (requis en dry-run/live) ─────────────────────────────────
@@ -193,6 +228,7 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
                 fetchTokenBalances(rpc, signer.publicKey),
               ]);
               const solBalanceSol = lamports / LAMPORTS_PER_SOL;
+              supervisor.noteSolBalance(solBalanceSol);
               let baseUsd: number;
               if (base === USDC_MINT) {
                 baseUsd = balances.find((balance) => balance.mint === USDC_MINT)?.amount ?? 0;
@@ -204,20 +240,10 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
             },
           }
         : {}),
-      stopFile: {
-        exists: () => fs.existsSync(stopPath),
-        createIfAbsent: () => {
-          try {
-            fs.writeFileSync(stopPath, `Kill-switch déclenché le ${new Date().toISOString()}\n`, {
-              flag: 'wx',
-            });
-          } catch {
-            // Le fichier existe déjà — rien à faire.
-          }
-        },
-      },
+      stopFile,
       onLog: (line) => console.log(`  ${ICONS.warn} ${line}`),
     });
+    engineRef = engine;
 
     const onSignal = (): void => {
       if (!engine.stopping) console.log('\n  arrêt demandé — fin du tick en cours…');
@@ -245,6 +271,12 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
         `  paper — caisse virtuelle ${config.paper.initial_usdc.toFixed(2)} ${config.base_currency}, fills modélisés (slippage ${config.paper.fill_slippage_bps} bps + frais).`,
       );
     }
+    if (supervision.monitoringUrl !== null) {
+      console.log(`  ${ICONS.ok} supervision : ${supervision.monitoringUrl} (/healthz, /metrics)`);
+    }
+    if (supervision.telegramCommands) {
+      console.log(`  ${ICONS.ok} commandes Telegram actives (/help pour la liste)`);
+    }
 
     let tickNumber = 0;
     try {
@@ -255,6 +287,10 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
         onTick: (result) => {
           tickNumber += 1;
           printTick(tickNumber, result);
+          supervisor.onTick(result);
+        },
+        onError: (info) => {
+          supervisor.onTickError(info);
         },
       });
 
@@ -277,6 +313,7 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
       process.off('SIGTERM', onSignal);
     }
   } finally {
+    await supervisor.stop();
     db.close();
   }
 }
@@ -285,11 +322,12 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
 function printTick(number: number, result: TickResult): void {
   const time = new Date(result.ts).toISOString().slice(11, 19);
   const kill = result.killSwitch ? ' · ⛔ entrées coupées' : '';
+  const pause = result.manualPaused ? ' · ⏸ pause manuelle' : '';
   console.log(
     `  ${time}  #${String(number).padStart(3)}  NAV ${result.navUsd.toFixed(2)} $ ` +
       `(caisse ${result.cashUsd.toFixed(2)} $, ${result.openCount} pos.)  ` +
       `dd ${result.drawdownPct.toFixed(2)} % · jour -${result.dailyLossPct.toFixed(2)} %  ` +
-      `prêts ${result.readyAssets}/${result.totalAssets}${kill}`,
+      `prêts ${result.readyAssets}/${result.totalAssets}${kill}${pause}`,
   );
   for (const line of result.entries) console.log(`      ${ICONS.ok} ${line}`);
   for (const line of result.exits) console.log(`      ${ICONS.warn} ${line}`);

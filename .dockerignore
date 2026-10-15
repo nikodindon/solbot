@@ -1,0 +1,12 @@
+node_modules
+dist
+data
+.env
+.env.*
+*.log
+STOP
+PAUSE
+.git
+.github
+tests
+coverage

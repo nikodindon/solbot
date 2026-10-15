@@ -4,6 +4,7 @@
 import './utils/warnings.js';
 import { Command } from 'commander';
 import { backtestCommand } from './cli/backtest.js';
+import { backupCommand } from './cli/backup.js';
 import { balanceCommand } from './cli/balance.js';
 import { doctorCommand } from './cli/doctor.js';
 import { initCommand } from './cli/init.js';
@@ -45,6 +46,9 @@ program.addCommand(versionCommand());
 // Phase 4 : backtest offline (garde-fou live) + rapport de métriques
 program.addCommand(backtestCommand());
 program.addCommand(reportCommand());
+
+// Phase 5 : sauvegardes SQLite (production 24/7)
+program.addCommand(backupCommand());
 
 program.showHelpAfterError('(lancez `solbot --help` pour la liste des commandes)');
 

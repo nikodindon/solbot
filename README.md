@@ -28,7 +28,7 @@
 9. [Gestion du risque](#9-gestion-du-risque)
 10. [Exécution & landing des transactions](#10-exécution--landing-des-transactions)
 11. [Backtesting & paper trading](#11-backtesting--paper-trading)
-12. [Observabilité & état](#12-observabilité--état)
+12. [Observabilité & production](#12-observabilité--production)
 13. [Roadmap avancée](#13-roadmap-avancée)
 14. [Sécurité — checklist](#14-sécurité--checklist)
 15. [Pièges connus & FAQ](#15-pièges-connus--faq)
@@ -404,8 +404,29 @@ execution:
 
 notifications:
   telegram:
-    enabled: false
-    notify_on: [trade, error, daily_report]
+    enabled: false               # true + TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID dans .env
+    notify_on: [trade, error, daily_report] # ajoutez alert, backup si souhaité
+    commands_enabled: true       # commandes entrantes : /status /positions /pnl /pause /resume /kill
+    daily_report_utc_hour: 8     # heure UTC du rapport PnL quotidien (moteur en marche)
+
+monitoring:                  # serveur HTTP local : /healthz (Docker/systemd) + /metrics (Prometheus)
+  enabled: false
+  host: 127.0.0.1
+  port: 9464
+
+alerts:                      # alerting (publié via notifications.telegram)
+  enabled: true
+  cooldown_min: 30             # anti-spam : délai minimal entre deux alertes d'une même règle
+  tick_error_threshold: 2      # erreurs de tick consécutives → alerte (« RPC en échec »)
+  execute_failure_window_min: 60 # fenêtre d'observation des échecs d'exécution (minutes)
+  execute_failure_min_trades: 5 # minimum de trades dans la fenêtre avant de calculer le taux
+  execute_failure_rate_pct: 30 # taux d'échec (%) au-delà duquel on alerte
+
+backups:                     # sauvegardes SQLite quotidiennes (`solbot backup` pour un backup manuel)
+  enabled: true
+  dir: ./data/backups
+  keep: 7                      # nombre de sauvegardes conservées (rotation)
+  daily_utc_hour: 3            # heure UTC du backup automatique pendant que le moteur tourne
 
 database:
   path: ./data/solbot.sqlite
@@ -617,16 +638,75 @@ signalé **non concluant** (`conclusive = false`).
 
 ---
 
-## 12. Observabilité & état
+## 12. Observabilité & production
+
+### 12.1 État local (source de vérité)
 
 - **SQLite** (`data/solbot.sqlite`) — source de vérité locale :
   `watchlist`, `price_ticks`, `candles`, `imported_candles`, `positions`, `position_lots`, `trades`,
   `signals`, `arbitrations`, `risk_rejections`, `events`, `equity_curve`, `bot_state`, `backtest_runs`,
   `backtest_equity`.
 - **Réconciliation au démarrage** : l'état des positions est reconstruit depuis la **chaîne** (soldes réels via RPC) puis confronté à la base ; toute divergence est journalisée et notifiée — jamais de "position fantôme".
-- **Logs pino JSON** : un flux par décision (`signal`, `arbitrage`, `risk`, `order`, `execute`, `error`), rotation quotidienne.
-- **Telegram** (Phase 5) : notification d'exécution, d'erreur, rapport PnL quotidien ; commandes `/status`, `/positions`, `/pnl`, `/pause`, `/resume`, `/kill`.
-- **Healthcheck** : endpoint HTTP local (Phase 5) pour Docker/systemd + métriques Prometheus.
+- **Logs pino JSON** : un flux par décision (`signal`, `arbitrage`, `risk`, `order`, `execute`, `error`).
+
+### 12.2 Supervision : `/healthz` + `/metrics`
+
+`monitoring.enabled: true` démarre un serveur HTTP **local** (sans authentification, `127.0.0.1` par défaut) :
+
+| Endpoint | Contenu |
+|---|---|
+| `GET /healthz` | JSON : `status` (`ok` / `stale` / `degraded`), mode, version, uptime, ticks, âge du dernier tick, NAV, pauses, kill-switch, dernier backup, état de la base. **HTTP 503** si le dernier tick dépasse `3 × intervalle` (moteur bloqué) ou si la base est indisponible |
+| `GET /metrics` | format Prometheus (text 0.0.4) : ticks, erreurs, NAV, caisse, positions, drawdown, perte jour, actifs prêts, entrées/sorties, alertes, notifications, backups, uptime, horodatage du dernier tick |
+
+Le healthcheck Docker s'appuie sur `/healthz` (503 → conteneur `unhealthy`) ; branchez Prometheus/Grafana sur `/metrics`.
+
+### 12.3 Telegram : notifications & commandes
+
+`notifications.telegram.enabled: true` + `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` dans `.env` :
+
+- **Notifications sortantes** (`notify_on`) : `trade` (chaque achat/vente), `error` (erreur de tick),
+  `daily_report` (rapport PnL quotidien à `daily_report_utc_hour` UTC), `alert` (§12.4), `backup` (backup quotidien).
+- **Commandes entrantes** (long polling, `commands_enabled`) — **seul le chat configuré est accepté** :
+
+| Commande | Effet |
+|---|---|
+| `/status` | dernier tick, NAV, positions, stratégies, pauses, kill-switch |
+| `/positions` | positions ouvertes : quantité, entrée, coût, stop, TP, pic observé, âge |
+| `/pnl [jours]` | PnL réalisé + frais sur la fenêtre (défaut 1 j), NAV du dernier tick |
+| `/pause` | suspend les **entrées** (les sorties SL/TP/trailing restent actives) — persisté en base |
+| `/resume` | réactive les entrées |
+| `/kill` | active le kill-switch (fichier `STOP`) : entrées coupées, sorties actives |
+| `/help` | aide |
+
+Les commandes lisent SQLite → elles fonctionnent même juste après un redémarrage. Une panne Telegram ne
+bloque jamais le moteur (best effort).
+
+### 12.4 Alerting
+
+Règles évaluées à chaque tick, anti-spam par règle (`alerts.cooldown_min`, horodatage persisté en base) :
+
+| Règle | Déclencheur |
+|---|---|
+| réserve de gaz SOL | live : solde SOL < `risk.sol_gas_reserve` (les entrées seront refusées par le risque) |
+| RPC / marché en échec | `tick_error_threshold` erreurs de tick consécutives (arrêt automatique à 5) |
+| taux d'échec d'exécution | ≥ `execute_failure_rate_pct` % d'échecs sur les trades de la fenêtre (`execute_failure_window_min`, minimum `execute_failure_min_trades`) |
+| divergence de réconciliation | au démarrage live : positions adoptées / ajustées / clôturées depuis la chaîne |
+
+### 12.5 Backups SQLite
+
+- **Automatique** : chaque jour après `backups.daily_utc_hour` (UTC), `VACUUM INTO` (cohérent, moteur en cours d'exécution) + rotation `backups.keep`.
+- **Manuel** : `solbot backup` · `solbot backup --list` · `solbot backup --keep 14`.
+- **Restauration** (moteur arrêté) : `solbot backup --restore <fichier> --yes` — intégrité vérifiée (`PRAGMA integrity_check`)
+  avant écrasement, journaux WAL/SHM périmés supprimés, puis `solbot doctor`.
+
+### 12.6 Déploiement 24/7
+
+- **Docker** : `docker compose up -d --build` — `Dockerfile` multi-étapes (deps prod seulement), volume `data/`,
+  `restart: unless-stopped`, healthcheck natif, logs bornés (5 × 10 Mo).
+- **systemd** (alternative) : `deploy/solbot.service` (redémarrage auto, logs journald) + `deploy/logrotate.solbot`
+  si vous redirigez les logs vers des fichiers.
+- **Reprise** : un redémarrage (crash, mise à jour, reboot) rejoue la réconciliation depuis la chaîne puis reprend
+  l'état SQLite — aucune intervention manuelle.
 
 ---
 
@@ -641,7 +721,7 @@ signalé **non concluant** (`conclusive = false`).
 | 2 | v0.3.0 | Premier swap : `/order` + `/execute`, dry-run, erreurs — ✅ **réalisée** | faible (manuel, montants choisis) |
 | 3 | v0.4.0 | Moteur autonome mono-stratégie + risque complet — ✅ **réalisée** | réel encadré |
 | 4 | v0.5.0 | Multi-stratégies + backtesting + paper complet — ✅ **réalisée** | réel encadré |
-| 5 | v0.6.0 | Production 24/7 : Docker, Telegram, métriques, backups | réel encadré |
+| 5 | v0.6.0 | Production 24/7 : Docker, Telegram, métriques, backups — ✅ **réalisée** | réel encadré |
 | 6 | v0.7.0 | Exécution avancée : `/build`, tx.jup.ag, Jito, v1 txs | réel avancé |
 | 7 | v1.0.0 | Intelligence & extensions : copy-trading, Trigger API, keystore | réel mature |
 
@@ -762,16 +842,33 @@ wallet vide (0 ordre — le drawdown kill-switch se déclenche avec un NAV à 0,
 🧪 **242 tests** (stratégies + arbitrage inter-stratégies, backtester bout-en-bout, import GeckoTerminal avec retry 429,
 garde-fou, rapport de métriques, routage CLI `backtest`/`import`).
 
-### Phase 5 — Production 24/7 (v0.6.0)
+### Phase 5 — Production 24/7 (v0.6.0) — ✅ **réalisée**
 
-- [ ] **Dockerfile** + `docker-compose` (volume `data/`, `restart: unless-stopped`) et unité systemd alternative
-- [ ] Healthcheck HTTP local + métriques Prometheus (`prom-client`), dashboard Grafana optionnel
-- [ ] **Telegram** : notifications (trade exécuté, erreur, rapport PnL quotidien) + commandes `/status`, `/positions`, `/pnl`, `/pause`, `/resume`, `/kill`
-- [ ] Alerting : solde SOL sous réserve, RPC en échec, taux d'échec `/execute` anormal, divergence de réconciliation
-- [ ] Sauvegardes SQLite quotidiennes + procédure de restauration testée
-- [ ] Rotation des logs, retry RPC avec providers de secours
+- [x] **Dockerfile** + `docker-compose` (volume `data/`, `restart: unless-stopped`) et unité systemd alternative (`deploy/`)
+- [x] Healthcheck HTTP local (`/healthz` → 503 si tick périmé) + métriques Prometheus (`/metrics`) — registre maison (aucune dépendance ajoutée)
+- [x] **Telegram** : notifications (trade, erreur, rapport PnL quotidien, alertes, backups) + commandes `/status`, `/positions`, `/pnl`, `/pause`, `/resume`, `/kill` (long polling, chat unique autorisé)
+- [x] Alerting : solde SOL sous réserve, RPC en échec, taux d'échec d'exécution anormal, divergence de réconciliation — cooldown persisté par règle
+- [x] Sauvegardes SQLite quotidiennes (`VACUUM INTO` + rotation) + `solbot backup` (création, liste, restauration vérifiée par `PRAGMA integrity_check`)
+- [x] Rotation des logs (journald/Docker bornés + `deploy/logrotate.solbot`), retry RPC avec provider de secours (hérité Phase 0)
+- [x] Pause manuelle des entrées (`/pause`) intégrée au moteur : les sorties SL/TP/trailing restent actives
 
-**DoD** : 7 jours d'uptime sans intervention manuelle ; toute exécution ou erreur notifiée en < 10 s ; restauration d'un backup SQLite validée sur un environnement neuf ; kill-switch testé à distance via Telegram.
+🧪 **291 tests** (dont 49 Phase 5 : registre de métriques, serveur `/healthz`+`/metrics`, notifier Telegram,
+poller de commandes avec autorisation par chat, contrôleur `/status`→`/kill`, moteur d'alertes avec cooldown,
+backups + restauration bout-en-bout, superviseur, pause manuelle du moteur).
+
+**DoD** : 7 jours d'uptime sans intervention manuelle ; toute exécution ou erreur notifiée en < 10 s ;
+restauration d'un backup SQLite validée sur un environnement neuf ; kill-switch testé à distance via Telegram.
+
+⏳ **Reste à observer** : la restauration de backup est **validée automatiquement** (test bout-en-bout sur base
+neuve) et la boucle kill-switch → fichier `STOP` est testée de bout en bout (contrôleur → moteur), mais la
+validation « grandeur nature » — 7 jours d'uptime et kill-switch depuis un vrai Telegram — sera mesurée une
+fois le bot déployé (Docker/systemd) avec un bot Telegram réel.
+
+🧪 **Vérifié de bout en bout (démo du 15/10/2026, home temporaire)** : `/healthz` → HTTP 200 et `/metrics`
+Prometheus pendant un run réel ; backup automatique déclenché au premier tick après l'heure configurée
+puis rotation `keep` ; `/pause` → tick marqué « ⏸ pause manuelle » ; `/kill` → tick marqué « ⛔ entrées
+coupées » (mêmes primitives que les commandes Telegram) ; restauration d'un backup sur un **environnement
+neuf** → 108 911 bougies importées et 6 runs de backtest retrouvés.
 
 ### Phase 6 — Exécution avancée (v0.7.0)
 

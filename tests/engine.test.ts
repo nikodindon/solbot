@@ -10,7 +10,13 @@ import {
 } from '../src/engine/engine.js';
 import type { Executor, SwapOutcome } from '../src/execution/executor.js';
 import type { PollSummary, PolledPrice } from '../src/market/poller.js';
-import { getNumberState, setNumberState, setState, STATE_KEYS } from '../src/state/bot-state.js';
+import {
+  deleteState,
+  getNumberState,
+  setNumberState,
+  setState,
+  STATE_KEYS,
+} from '../src/state/bot-state.js';
 import { openDatabase } from '../src/state/db.js';
 import { getRecentEvents } from '../src/state/events.js';
 import { runMigrations } from '../src/state/migrations.js';
@@ -905,6 +911,27 @@ describe('Engine — Phase 4 : arbitrage, ajouts, sorties partielles', () => {
 
     const trade = getRecentTrades(h.db)[0]!;
     expect(trade.feeUsd).toBeGreaterThan(0);
+    h.db.close();
+  });
+});
+
+describe('Engine — pause manuelle des entrées', () => {
+  it('ignore les entrées (signal journalisé) puis les reprend après /resume', async () => {
+    const h = harness({ signals: [buySignal()] });
+    h.prices.set(A, price(2));
+    setState(h.db, STATE_KEYS.manualPaused, '1', NOW);
+
+    const paused = await h.engine.runOnce();
+    expect(paused.manualPaused).toBe(true);
+    expect(paused.entries).toEqual([]);
+    expect(paused.rejections.join(' ')).toContain('pause manuelle');
+    // Signal bien tracé comme non exécuté (audit).
+    expect(getRecentSignals(h.db)[0]).toMatchObject({ side: 'buy', acted: false });
+
+    deleteState(h.db, STATE_KEYS.manualPaused);
+    const resumed = await h.engine.runOnce();
+    expect(resumed.manualPaused).toBe(false);
+    expect(resumed.entries).toHaveLength(1);
     h.db.close();
   });
 });

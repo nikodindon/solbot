@@ -79,6 +79,8 @@ export interface TickResult {
   dailyLossPct: number;
   killSwitch: boolean;
   pausedUntilMs: number | null;
+  /** Pause manuelle des entrées (`/pause`) — les sorties restent actives. */
+  manualPaused: boolean;
   entries: string[];
   exits: string[];
   rejections: string[];
@@ -92,6 +94,8 @@ export interface EngineRunOptions {
   durationS?: number;
   intervalS?: number;
   onTick?: (result: TickResult) => void;
+  /** Erreur d'un tick (le moteur retente tant que < MAX_CONSECUTIVE_ERRORS). */
+  onError?: (info: { consecutive: number; message: string }) => void;
 }
 
 export interface EngineSummary {
@@ -201,6 +205,7 @@ export class Engine {
           ts: this.now(),
         });
         this.log(`erreur de tick (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}) : ${message}`);
+        options.onError?.({ consecutive: consecutiveErrors, message });
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           stopReason = 'error';
           break;
@@ -324,6 +329,10 @@ export class Engine {
         ts,
       });
     }
+
+    // Pause manuelle (`/pause` Telegram) : persistée en base, sorties actives.
+    const manualPaused = getState(db, STATE_KEYS.manualPaused) === '1';
+    const entriesPaused = manualPaused || (pausedUntilMs !== null && pausedUntilMs > ts);
 
     if (drawdownPct >= config.risk.max_drawdown_pct && !this.deps.stopFile.exists()) {
       this.deps.stopFile.createIfAbsent();
@@ -465,15 +474,21 @@ export class Engine {
 
     // ── 6. Entrées : arbitrage puis contrôles de risque ────────────────────
     const entries: string[] = [];
-    if (killSwitch || (pausedUntilMs !== null && pausedUntilMs > ts)) {
+    if (killSwitch || entriesPaused) {
       if (buyGroups.length > 0) {
         rejections.push(
           killSwitch
             ? `entrées coupées (kill-switch actif) : ${buyGroups.length} signal(aux) ignoré(s)`
-            : `entrées en pause (perte journalière) : ${buyGroups.length} signal(aux) ignoré(s)`,
+            : manualPaused
+              ? `entrées en pause manuelle : ${buyGroups.length} signal(aux) ignoré(s)`
+              : `entrées en pause (perte journalière) : ${buyGroups.length} signal(aux) ignoré(s)`,
         );
         for (const group of buyGroups) {
-          journalGroup(group, killSwitch ? 'kill_switch' : 'daily_loss_pause', false);
+          journalGroup(
+            group,
+            killSwitch ? 'kill_switch' : manualPaused ? 'manual_pause' : 'daily_loss_pause',
+            false,
+          );
         }
       }
     } else {
@@ -562,6 +577,7 @@ export class Engine {
       dailyLossPct,
       killSwitch,
       pausedUntilMs,
+      manualPaused,
       entries,
       exits,
       rejections,

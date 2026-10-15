@@ -103,8 +103,29 @@ execution:
 
 notifications:
   telegram:
-    enabled: false
-    notify_on: [trade, error, daily_report]
+    enabled: false # true + TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID renseignés dans .env
+    notify_on: [trade, error, daily_report] # ajoutez alert, backup si souhaité
+    commands_enabled: true # commandes entrantes : /status /positions /pnl /pause /resume /kill
+    daily_report_utc_hour: 8 # heure UTC du rapport PnL quotidien (moteur en marche)
+
+monitoring: # serveur HTTP local : /healthz (Docker/systemd) + /metrics (Prometheus)
+  enabled: false
+  host: 127.0.0.1
+  port: 9464
+
+alerts: # alerting (publie via notifications.telegram.enabled)
+  enabled: true
+  cooldown_min: 30 # anti-spam : délai minimal entre deux alertes d'une même règle
+  tick_error_threshold: 2 # erreurs de tick consécutives → alerte (« RPC en échec »)
+  execute_failure_window_min: 60 # fenêtre d'observation des échecs d'exécution (minutes)
+  execute_failure_min_trades: 5 # minimum de trades dans la fenêtre avant de calculer le taux
+  execute_failure_rate_pct: 30 # taux d'échec (%) au-delà duquel on alerte
+
+backups: # sauvegardes SQLite quotidiennes (`solbot backup` pour un backup manuel)
+  enabled: true
+  dir: ./data/backups
+  keep: 7 # nombre de sauvegardes conservées (rotation)
+  daily_utc_hour: 3 # heure UTC du backup automatique pendant que le moteur tourne
 
 database:
   path: ./data/solbot.sqlite

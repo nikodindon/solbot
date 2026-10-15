@@ -63,6 +63,17 @@ describe('parseConfig', () => {
     expect(config.strategies.momentum.enabled).toBe(true);
     expect(config.strategies.mean_reversion.enabled).toBe(false);
     expect(config.notifications.telegram.enabled).toBe(false);
+    expect(config.notifications.telegram.commands_enabled).toBe(true);
+    expect(config.notifications.telegram.daily_report_utc_hour).toBe(8);
+    expect(config.monitoring.enabled).toBe(false);
+    expect(config.monitoring.host).toBe('127.0.0.1');
+    expect(config.monitoring.port).toBe(9464);
+    expect(config.alerts.enabled).toBe(true);
+    expect(config.alerts.cooldown_min).toBe(30);
+    expect(config.alerts.tick_error_threshold).toBe(2);
+    expect(config.backups.enabled).toBe(true);
+    expect(config.backups.keep).toBe(7);
+    expect(config.backups.daily_utc_hour).toBe(3);
     expect(config.universe.category).toBe('toptraded');
     expect(config.universe.interval).toBe('24h');
     expect(config.universe.candidate_limit).toBe(100);
@@ -71,6 +82,14 @@ describe('parseConfig', () => {
 
   it('rejette une clé inconnue (typo dans une section)', () => {
     expect(() => parseConfig({ univers: {} })).toThrowError(/Univers|univers|Unrecognized/i);
+    expect(() => parseConfig({ monitoring: { portat: 1234 } })).toThrowError(
+      /portat|Unrecognized/i,
+    );
+  });
+
+  it('rejette un port de supervision hors bornes et un cooldown nul', () => {
+    expect(() => parseConfig({ monitoring: { port: 0 } })).toThrowError(/port/);
+    expect(() => parseConfig({ alerts: { cooldown_min: 0 } })).toThrowError(/cooldown_min/);
   });
 
   it('rejette un mode invalide', () => {

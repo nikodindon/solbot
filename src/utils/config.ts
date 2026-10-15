@@ -168,12 +168,46 @@ const ExecutionSchema = z.strictObject({
 const TelegramSchema = z.strictObject({
   enabled: z.boolean().default(false),
   notify_on: z
-    .array(z.enum(['trade', 'error', 'daily_report']))
+    .array(z.enum(['trade', 'error', 'daily_report', 'alert', 'backup']))
     .default(['trade', 'error', 'daily_report']),
+  /** Commandes entrantes (`/status`, `/pause`, `/kill`…) — long polling. */
+  commands_enabled: z.boolean().default(true),
+  /** Heure UTC (0–23) du rapport PnL quotidien pendant que le moteur tourne. */
+  daily_report_utc_hour: z.number().int().min(0).max(23).default(8),
 });
 
 const NotificationsSchema = z.strictObject({
   telegram: TelegramSchema.default(TelegramSchema.parse({})),
+});
+
+const MonitoringSchema = z.strictObject({
+  /** Serveur HTTP local : `/healthz` (Docker/systemd) et `/metrics` (Prometheus). */
+  enabled: z.boolean().default(false),
+  host: z.string().min(1).default('127.0.0.1'),
+  port: z.number().int().min(1).max(65535).default(9464),
+});
+
+const AlertsSchema = z.strictObject({
+  enabled: z.boolean().default(true),
+  /** Anti-spam : délai minimal entre deux alertes d'une même règle (minutes). */
+  cooldown_min: z.number().int().min(1).max(1440).default(30),
+  /** Erreurs de tick consécutives déclenchant une alerte (« RPC en échec »). */
+  tick_error_threshold: z.number().int().min(1).max(10).default(2),
+  /** Fenêtre d'observation du taux d'échec d'exécution (minutes). */
+  execute_failure_window_min: z.number().int().min(1).max(1440).default(60),
+  /** Minimum de trades dans la fenêtre avant de calculer le taux. */
+  execute_failure_min_trades: z.number().int().min(1).max(100).default(5),
+  /** Taux d'échec d'exécution (%) au-delà duquel une alerte est émise. */
+  execute_failure_rate_pct: percent.default(30),
+});
+
+const BackupsSchema = z.strictObject({
+  enabled: z.boolean().default(true),
+  dir: z.string().min(1).default('./data/backups'),
+  /** Nombre de sauvegardes conservées (rotation). */
+  keep: z.number().int().min(1).max(90).default(7),
+  /** Heure UTC (0–23) du backup quotidien pendant que le moteur tourne. */
+  daily_utc_hour: z.number().int().min(0).max(23).default(3),
 });
 
 const DatabaseSchema = z.strictObject({
@@ -193,6 +227,9 @@ export const ConfigSchema = z.strictObject({
   engine: EngineSchema.default(EngineSchema.parse({})),
   backtest: BacktestSchema.default(BacktestSchema.parse({})),
   notifications: NotificationsSchema.default(NotificationsSchema.parse({})),
+  monitoring: MonitoringSchema.default(MonitoringSchema.parse({})),
+  alerts: AlertsSchema.default(AlertsSchema.parse({})),
+  backups: BackupsSchema.default(BackupsSchema.parse({})),
   database: DatabaseSchema.default(DatabaseSchema.parse({})),
 });
 

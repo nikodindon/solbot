@@ -1,0 +1,37 @@
+# solbot — unité systemd (alternative à Docker, Phase 5)
+#
+# Installation :
+#   sudo useradd --system --create-home --home-dir /opt/solbot solbot
+#   sudo -u solbot git clone <dépôt> /opt/solbot && cd /opt/solbot
+#   sudo -u solbot npm ci && sudo -u solbot npm run build
+#   sudo -u solbot cp .env.example .env   # puis init / secrets
+#   sudo cp deploy/solbot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now solbot
+#   journalctl -u solbot -f
+[Unit]
+Description=solbot — bot de trading spot Solana (paper par défaut)
+Documentation=https://github.com/nikodindon/solbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/solbot
+Environment=SOLBOT_HOME=/opt/solbot
+EnvironmentFile=/opt/solbot/.env
+ExecStart=/usr/bin/node /opt/solbot/dist/index.js start
+# Redémarrage automatique : le moteur reprend l'état réconcilié depuis SQLite.
+Restart=on-failure
+RestartSec=10s
+# journald gère la rotation des logs (cf. deploy/logrotate.solbot pour un
+# stockage fichier, non utilisé par défaut).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solbot
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

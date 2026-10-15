@@ -47,4 +47,12 @@ export const STATE_KEYS = {
   paperCashUsdc: 'paper_cash_usdc',
   lastTickTs: 'last_tick_ts',
   engineStartedAt: 'engine_started_at',
+  /** Pause manuelle des entrées (`/pause` Telegram, `solbot pause`) — les sorties restent actives. */
+  manualPaused: 'manual_paused',
+  /** Jour UTC du dernier backup automatique (`YYYY-MM-DD`). */
+  lastBackupDay: 'last_backup_day',
+  /** Jour UTC du dernier rapport PnL quotidien Telegram. */
+  lastDailyReportDay: 'last_daily_report_day',
+  /** Préfixe des horodatages d'anti-spam d'alertes (`alert_last_<règle>`). */
+  alertLastPrefix: 'alert_last_',
 } as const;

@@ -1,0 +1,30 @@
+# solbot — production 24/7 (Phase 5)
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+#   docker compose exec solbot node dist/index.js report
+#
+# Prérequis : `.env` (wallet + clés) et `config/config.yaml` à la racine.
+services:
+  solbot:
+    build: .
+    image: solbot:0.6.0
+    restart: unless-stopped
+    # Secrets et réglages : .env à la racine du projet (jamais versionné).
+    env_file: .env
+    environment:
+      SOLBOT_HOME: /app
+    volumes:
+      # Configuration vivante (modifiable sans rebuild).
+      - ./config:/app/config:ro
+      # Base SQLite + backups + STOP — persistants.
+      - ./data:/app/data
+    # Le serveur de supervision (/healthz, /metrics) reste local par défaut :
+    # décommentez pour l'exposer (nécessite monitoring.enabled: true).
+    # ports:
+    #   - "127.0.0.1:9464:9464"
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
