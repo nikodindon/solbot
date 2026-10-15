@@ -54,6 +54,9 @@ Principes directeurs :
 Le projet démarre volontairement simple (`.env` + un process Node + SQLite) pour itérer vite, et monte en
 robustesse progressivement (voir la [roadmap](#13-roadmap-avancée)).
 
+> 📄 **Pas développeur ?** Une [présentation dédiée](docs/presentation.md) (pitch 30 s, 13 slides,
+> glossaire) explique le bot aux traders particuliers.
+
 ---
 
 ## 2. Fonctionnalités cibles (v1.0)
