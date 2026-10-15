@@ -21,6 +21,21 @@ export interface AssetSnapshot {
 export interface MarketSnapshot {
   ts: number;
   assets: AssetSnapshot[];
+  /** État du portefeuille au moment de l'évaluation (stratégies de rotation/DCA). */
+  portfolio?: PortfolioContext;
+}
+
+/** Vue portefeuille offerte aux stratégies (lecture seule). */
+export interface PortfolioContext {
+  navUsd: number;
+  cashUsd: number;
+  /** Valeur mark-to-market par mint (positions ouvertes uniquement). */
+  valueByMint: Map<string, number>;
+  /** Détail des positions ouvertes (pour les ajouts type grille). */
+  positionsByMint: Map<
+    string,
+    { qtyRemaining: string; decimals: number; avgEntryPriceUsd: number }
+  >;
 }
 
 export interface Signal {
@@ -37,6 +52,12 @@ export interface Signal {
   reason: string;
   /** Stop suggéré en % sous le prix d'entrée (ex. stop ATR du momentum). */
   suggestedStopLossPct?: number;
+  /** Autorise l'ajout à une position déjà ouverte (grille/DCA). Défaut : false. */
+  allowAdd?: boolean;
+  /** Notionnel souhaité en USD (plafond suggéré — le RiskManager reste maître). */
+  suggestedSizeUsd?: number;
+  /** Fraction de la position à vendre, (0..1] — sorties partielles (rotation). Défaut : 1. */
+  sellPortion?: number;
 }
 
 /**

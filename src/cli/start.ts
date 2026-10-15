@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as readline from 'node:readline/promises';
+import type { DatabaseSync } from 'node:sqlite';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { Command } from 'commander';
+import { findGuardRun, paramsHash } from '../backtest/store.js';
 import { SOL_MINT, USDC_MINT } from '../constants.js';
 import { Engine, type EngineMode, type TickResult } from '../engine/engine.js';
 import { reconcileBalances, type ChainBalance } from '../engine/reconcile.js';
@@ -71,6 +73,9 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
   const swapApi = new SwapApi(client);
   const strategies = buildStrategies(config);
   const weights = strategyWeights(config);
+  if (mode === 'live') {
+    enforceBacktestGuard(db, config);
+  }
 
   let watchlist = getWatchlist(db);
   if (watchlist.length === 0 || options.refresh === true) {
@@ -289,6 +294,36 @@ function printTick(number: number, result: TickResult): void {
   for (const line of result.entries) console.log(`      ${ICONS.ok} ${line}`);
   for (const line of result.exits) console.log(`      ${ICONS.warn} ${line}`);
   for (const line of result.rejections) console.log(`      · ${line}`);
+}
+
+/**
+ * Garde-fou Phase 4 (DoD) : aucune stratégie ne peut tourner en live sans un
+ * backtest **concluant** (≥ `backtest.guard.min_days` jours de données) pour
+ * exactement ce jeu de paramètres (empreinte sha256). Optionnellement, exiger
+ * un PnL net positif (`require_positive_net_pnl: true`).
+ */
+function enforceBacktestGuard(db: DatabaseSync, config: Config): void {
+  const hash = paramsHash(config);
+  const guard = findGuardRun(db, hash, config.backtest.guard.min_days);
+  if (guard === null) {
+    throw new SolbotError(
+      `Garde-fou Phase 4 : aucun backtest concluant (≥ ${config.backtest.guard.min_days} j) pour ces paramètres — live bloqué`,
+      {
+        hint: 'Importez l’historique (`solbot backtest import --days 30`) puis lancez `solbot backtest --days 30`, et réessayez.',
+      },
+    );
+  }
+  if (config.backtest.guard.require_positive_net_pnl && guard.metrics.netPnlUsd <= 0) {
+    throw new SolbotError(
+      `Garde-fou Phase 4 : le backtest de référence (#${guard.id}) est perdant (${guard.metrics.netPnlUsd.toFixed(2)} $) et require_positive_net_pnl exige un PnL net positif`,
+      {
+        hint: 'Révisez les paramètres, ou passez backtest.guard.require_positive_net_pnl à false en connaissance de cause.',
+      },
+    );
+  }
+  console.log(
+    `  ${ICONS.ok} garde-fou backtest : run #${guard.id} (${guard.days.toFixed(1)} j, PnL net ${guard.metrics.netPnlUsd.toFixed(2)} $, empreinte ${hash.slice(0, 8)})`,
+  );
 }
 
 function resolveMode(options: StartCliOptions, config: Config): EngineMode {

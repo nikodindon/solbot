@@ -98,3 +98,15 @@ export function average(values: number[]): number | null {
   if (clean.length === 0) return null;
   return clean.reduce((sum, value) => sum + value, 0) / clean.length;
 }
+
+/**
+ * Écart-type de population (valeurs finies uniquement) ; `null` si aucune
+ * valeur. Une seule valeur → `0`.
+ */
+export function stdev(values: number[]): number | null {
+  const clean = values.filter((value) => Number.isFinite(value));
+  if (clean.length === 0) return null;
+  const mean = clean.reduce((sum, value) => sum + value, 0) / clean.length;
+  const variance = clean.reduce((sum, value) => sum + (value - mean) ** 2, 0) / clean.length;
+  return Math.sqrt(variance);
+}

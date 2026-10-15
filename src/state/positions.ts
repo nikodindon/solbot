@@ -24,6 +24,8 @@ export interface PositionRow {
   openedAt: number;
   updatedAt: number;
   closedAt: number | null;
+  /** Mode d'origine (paper | dry_run | live) — `null` pour les positions héritées. */
+  mode: string | null;
 }
 
 interface PositionDbRow {
@@ -43,6 +45,7 @@ interface PositionDbRow {
   opened_at: number;
   updated_at: number;
   closed_at: number | null;
+  mode: string | null;
 }
 
 interface LotRow {
@@ -71,6 +74,7 @@ function toDomain(row: PositionDbRow): PositionRow {
     openedAt: row.opened_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at,
+    mode: row.mode,
   };
 }
 
@@ -120,6 +124,8 @@ export interface OpenPositionInput {
   ts: number;
   stopLossPriceUsd?: number | null;
   takeProfitPriceUsd?: number | null;
+  /** Mode d'origine (paper | dry_run | live). */
+  mode?: string | null;
 }
 
 /**
@@ -144,8 +150,8 @@ export function openPosition(db: DatabaseSync, input: OpenPositionInput): Positi
       `INSERT INTO positions
         (mint, symbol, decimals, status, qty, qty_remaining, avg_entry_price_usd, cost_basis_usd,
          realized_pnl_usd, peak_price_usd, stop_loss_price_usd, take_profit_price_usd,
-         opened_at, updated_at)
-       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+         opened_at, updated_at, mode)
+       VALUES (?, ?, ?, 'open', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.mint,
@@ -160,6 +166,7 @@ export function openPosition(db: DatabaseSync, input: OpenPositionInput): Positi
       input.takeProfitPriceUsd ?? null,
       input.ts,
       input.ts,
+      input.mode ?? null,
     ) as unknown as { lastInsertRowid: number | bigint };
 
   const positionId = Number(result.lastInsertRowid);

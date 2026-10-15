@@ -30,6 +30,8 @@ export interface TradeRecord {
   strategy?: string | null;
   /** Déclencheur : entry, stop_loss, take_profit, trailing_stop, momentum_exit… */
   trigger?: string | null;
+  /** Frais modélisés en USD (paper/backtest) — `null` si inconnus (live). */
+  feeUsd?: number | null;
 }
 
 interface TradeRow {
@@ -54,6 +56,7 @@ interface TradeRow {
   created_at: number;
   strategy: string | null;
   trigger: string | null;
+  fee_usd: number | null;
 }
 
 /** Journalise une intention de swap. Retourne l'id de la ligne créée. */
@@ -64,8 +67,8 @@ export function insertTrade(db: DatabaseSync, trade: TradeRecord): number {
         (mode, status, signature, request_id, input_mint, output_mint, in_amount,
          expected_out_amount, out_amount, router, fee_bps, fee_mint, price_impact,
          slippage_bps, realized_slippage_bps, error_code, error_message, created_at,
-         strategy, trigger)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         strategy, trigger, fee_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       trade.mode,
@@ -88,6 +91,7 @@ export function insertTrade(db: DatabaseSync, trade: TradeRecord): number {
       trade.createdAt,
       trade.strategy ?? null,
       trade.trigger ?? null,
+      trade.feeUsd ?? null,
     ) as unknown as { lastInsertRowid: number | bigint };
   return Number(result.lastInsertRowid);
 }
@@ -138,5 +142,6 @@ export function getRecentTrades(db: DatabaseSync, limit = 20): Array<TradeRecord
     createdAt: row.created_at,
     strategy: row.strategy,
     trigger: row.trigger,
+    feeUsd: row.fee_usd,
   }));
 }

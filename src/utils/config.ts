@@ -65,10 +65,34 @@ const MOMENTUM_DEFAULT = {
   },
 };
 
+const MEAN_REVERSION_DEFAULT = {
+  enabled: false,
+  weight: 1,
+  timeframe: '15m',
+  params: {
+    window: 96,
+    z_entry: 2.0,
+    z_exit: 0.5,
+    mode: 'zscore',
+    grid_step_pct: 1.0,
+    grid_levels: 5,
+  },
+};
+
+const DCA_ROTATION_DEFAULT = {
+  enabled: false,
+  weight: 0.5,
+  params: {
+    target_alloc: { SOL: 0.4, USDC: 0.6 },
+    drift_trigger_pct: 5,
+    topup_usdc: 25,
+  },
+};
+
 const StrategiesSchema = z.strictObject({
   momentum: StrategySchema.default(MOMENTUM_DEFAULT),
-  mean_reversion: StrategySchema.default(StrategySchema.parse({})),
-  dca_rotation: StrategySchema.default(StrategySchema.parse({})),
+  mean_reversion: StrategySchema.default(MEAN_REVERSION_DEFAULT),
+  dca_rotation: StrategySchema.default(DCA_ROTATION_DEFAULT),
   copy_trade: StrategySchema.default(StrategySchema.parse({})),
 });
 
@@ -76,6 +100,35 @@ const PaperSchema = z.strictObject({
   initial_usdc: z.number().min(1).default(1000),
   /** Slippage modélisé sur chaque fill paper (aller simple). */
   fill_slippage_bps: z.number().int().min(0).max(500).default(20),
+  /** Impact de marché modélisé (paper) : impact ≈ impact_k × notionnel / liquidité. */
+  impact_k: z.number().min(0).max(10).default(0),
+  /** Priority fee + frais réseau par swap, en SOL (0 = ignoré). */
+  priority_fee_sol: z.number().min(0).default(0),
+  /** Force le barème de frais (bps) au lieu du barème Jupiter par paire. */
+  fee_bps_override: z.number().int().min(0).max(500).nullable().default(null),
+});
+
+const BacktestCostsSchema = z.strictObject({
+  fill_slippage_bps: z.number().int().min(0).max(500).default(10),
+  impact_k: z.number().min(0).max(10).default(0.5),
+  priority_fee_sol: z.number().min(0).default(0.00005),
+  fee_bps_override: z.number().int().min(0).max(500).nullable().default(null),
+});
+
+const BacktestGuardSchema = z.strictObject({
+  /** Couverture minimale (jours de données) pour qu'un backtest soit concluant. */
+  min_days: z.number().min(0).max(365).default(30),
+  /** Exiger un PnL net positif pour autoriser le live (garde-fou renforcé). */
+  require_positive_net_pnl: z.boolean().default(false),
+});
+
+const BacktestSchema = z.strictObject({
+  timeframe: z.enum(['1m', '5m', '15m', '1h']).default('15m'),
+  initial_usdc: z.number().min(1).default(1000),
+  /** Liquidité statique de secours (USD) si la watchlist n'en fournit pas. */
+  default_liquidity_usd: z.number().min(0).default(250_000),
+  costs: BacktestCostsSchema.default(BacktestCostsSchema.parse({})),
+  guard: BacktestGuardSchema.default(BacktestGuardSchema.parse({})),
 });
 
 const EngineSchema = z.strictObject({
@@ -138,6 +191,7 @@ export const ConfigSchema = z.strictObject({
   execution: ExecutionSchema.default(ExecutionSchema.parse({})),
   paper: PaperSchema.default(PaperSchema.parse({})),
   engine: EngineSchema.default(EngineSchema.parse({})),
+  backtest: BacktestSchema.default(BacktestSchema.parse({})),
   notifications: NotificationsSchema.default(NotificationsSchema.parse({})),
   database: DatabaseSchema.default(DatabaseSchema.parse({})),
 });

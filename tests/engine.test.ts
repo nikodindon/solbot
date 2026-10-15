@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DatabaseSync } from 'node:sqlite';
-import { USDC_MINT } from '../src/constants.js';
+import { SOL_MINT, USDC_MINT } from '../src/constants.js';
 import {
   Engine,
   nextUtcMidnight,
@@ -83,8 +83,12 @@ function sellSignal(overrides: Partial<Signal> = {}): Signal {
   };
 }
 
-function scriptedStrategy(signals: Signal[], requiredData: DataRequirement[] = []): Strategy {
-  return { name: 'test', requiredData, evaluate: () => signals };
+function scriptedStrategy(
+  signals: Signal[],
+  requiredData: DataRequirement[] = [],
+  name = 'test',
+): Strategy {
+  return { name, requiredData, evaluate: () => signals };
 }
 
 interface Harness {
@@ -109,6 +113,8 @@ function harness(
     requiredData?: DataRequirement[];
     assets?: Array<{ mint: string; symbol: string }>;
     stopExists?: boolean;
+    strategies?: Strategy[];
+    weights?: Map<string, number>;
   } = {},
 ): Harness {
   const db = memoryDb();
@@ -130,8 +136,10 @@ function harness(
     db,
     config,
     mode: options.mode ?? 'paper',
-    strategies: [scriptedStrategy(options.signals ?? [], options.requiredData)],
-    weights: new Map([['test', 1]]),
+    strategies: options.strategies ?? [
+      scriptedStrategy(options.signals ?? [], options.requiredData),
+    ],
+    weights: options.weights ?? new Map([['test', 1]]),
     poll: async (mints): Promise<PollSummary> => ({
       ts: NOW,
       requested: mints.length,
@@ -467,8 +475,8 @@ describe('Engine — sorties', () => {
     const result = await h.engine.runOnce();
 
     expect(result.exits).toHaveLength(1);
-    expect(result.exits[0]).toContain('sortie momentum');
-    expect(getRecentTrades(h.db)[0]).toMatchObject({ trigger: 'momentum_exit', strategy: 'test' });
+    expect(result.exits[0]).toContain('vente AAA (test_exit)');
+    expect(getRecentTrades(h.db)[0]).toMatchObject({ trigger: 'test_exit', strategy: 'test' });
     const closed = getRecentSignals(h.db)[0];
     expect(closed).toMatchObject({ side: 'sell', acted: true });
     h.db.close();
@@ -711,5 +719,192 @@ describe('utilitaires de temps', () => {
     expect(utcDayKey(ts)).toBe('2026-10-15');
     expect(nextUtcMidnight(ts)).toBe(Date.UTC(2026, 9, 16, 0, 0, 0));
     expect(nextUtcMidnight(Date.UTC(2026, 11, 31, 23, 59, 59))).toBe(Date.UTC(2027, 0, 1));
+  });
+});
+
+interface ArbitrationRow {
+  side: string;
+  reason: string;
+  chosen_strategy: string | null;
+  chosen_score: number | null;
+  candidates: string;
+}
+
+function arbitrationRows(db: DatabaseSync): ArbitrationRow[] {
+  return db
+    .prepare(
+      'SELECT side, reason, chosen_strategy, chosen_score, candidates FROM arbitrations ORDER BY id',
+    )
+    .all() as unknown as ArbitrationRow[];
+}
+
+describe('Engine — Phase 4 : arbitrage, ajouts, sorties partielles', () => {
+  it('ajoute à une position uniquement si le signal l’autorise (allowAdd)', async () => {
+    const ignored = harness({ signals: [buySignal()] });
+    openPosition(ignored.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '5000000',
+      priceUsd: 1,
+      ts: NOW - 1_000,
+      stopLossPriceUsd: 0.9,
+      takeProfitPriceUsd: 1.2,
+    });
+    ignored.prices.set(A, price(1));
+
+    const withoutAdd = await ignored.engine.runOnce();
+    expect(withoutAdd.entries).toEqual([]);
+    expect(getOpenPosition(ignored.db, A)!.qtyRemaining).toBe('5000000');
+    ignored.db.close();
+
+    const added = harness({ signals: [buySignal({ allowAdd: true })] });
+    openPosition(added.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '5000000',
+      priceUsd: 1,
+      ts: NOW - 1_000,
+      stopLossPriceUsd: 0.9,
+      takeProfitPriceUsd: 1.2,
+    });
+    added.prices.set(A, price(1));
+
+    const withAdd = await added.engine.runOnce();
+    expect(withAdd.entries).toHaveLength(1);
+    expect(BigInt(getOpenPosition(added.db, A)!.qtyRemaining) > 5_000_000n).toBe(true);
+    added.db.close();
+  });
+
+  it('autorise l’achat de SOL (cible DCA) même hors watchlist', async () => {
+    const h = harness({ signals: [buySignal({ assetMint: SOL_MINT, symbol: 'SOL' })] });
+    h.prices.set(SOL_MINT, price(150, 1_000_000_000, 9));
+
+    const result = await h.engine.runOnce();
+
+    expect(result.entries[0]).toContain('achat SOL');
+    expect(getOpenPosition(h.db, SOL_MINT)).not.toBeNull();
+    expect(getRecentTrades(h.db)[0]).toMatchObject({ outputMint: SOL_MINT, mode: 'paper' });
+    h.db.close();
+  });
+
+  it('libère une fraction seulement pour une sortie partielle (sellPortion)', async () => {
+    const h = harness({ signals: [sellSignal({ sellPortion: 0.5 })] });
+    const position = openPosition(h.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '10000000',
+      priceUsd: 1,
+      ts: NOW - 1_000,
+      stopLossPriceUsd: 0.9,
+      takeProfitPriceUsd: 5,
+    });
+    h.prices.set(A, price(1.2));
+
+    const result = await h.engine.runOnce();
+
+    expect(result.exits).toHaveLength(1);
+    const after = getPositionById(h.db, position.id)!;
+    expect(after.status).toBe('open');
+    expect(after.qtyRemaining).toBe('5000000');
+    h.db.close();
+  });
+
+  it('journalise l’arbitrage et retient le meilleur score (confiance × poids × edge)', async () => {
+    const h = harness({
+      strategies: [
+        scriptedStrategy([buySignal({ confidence: 0.5 })], [], 'alpha'),
+        scriptedStrategy([buySignal({ confidence: 0.9 })], [], 'beta'),
+      ],
+      weights: new Map([
+        ['alpha', 1],
+        ['beta', 1],
+      ]),
+    });
+    h.prices.set(A, price(1));
+
+    const result = await h.engine.runOnce();
+
+    expect(result.entries).toHaveLength(1);
+    expect(getRecentTrades(h.db)[0]).toMatchObject({ strategy: 'beta', trigger: 'entry' });
+
+    const rows = arbitrationRows(h.db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ side: 'buy', reason: 'best_score', chosen_strategy: 'beta' });
+    const candidates = JSON.parse(rows[0]!.candidates) as Array<{
+      strategy: string;
+      chosen: boolean;
+      reason: string;
+      score: number;
+    }>;
+    expect(
+      candidates.map((candidate) => [candidate.strategy, candidate.chosen, candidate.reason]),
+    ).toEqual([
+      ['beta', true, 'best_score'],
+      ['alpha', false, 'lower_score'],
+    ]);
+    expect(candidates[0]!.score).toBeCloseTo(0.9, 9);
+    h.db.close();
+  });
+
+  it('conflit achat/vente sur un même actif : la sortie prime (exit_priority)', async () => {
+    const h = harness({
+      strategies: [
+        scriptedStrategy(
+          [sellSignal(), buySignal({ confidence: 0.95, allowAdd: true })],
+          [],
+          'conflicted',
+        ),
+      ],
+      weights: new Map([['conflicted', 1]]),
+    });
+    openPosition(h.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '10000000',
+      priceUsd: 1,
+      ts: NOW - 1_000,
+      stopLossPriceUsd: 0.9,
+      takeProfitPriceUsd: 1.2,
+    });
+    h.prices.set(A, price(1.1));
+
+    const result = await h.engine.runOnce();
+
+    expect(result.entries).toEqual([]);
+    expect(result.exits).toHaveLength(1);
+    const rows = arbitrationRows(h.db);
+    const sellRow = rows.find((row) => row.side === 'sell' && row.reason === 'best_score');
+    const buyRow = rows.find((row) => row.side === 'buy');
+    expect(sellRow?.chosen_strategy).toBe('conflicted');
+    expect(buyRow).toMatchObject({ reason: 'exit_priority', chosen_strategy: null });
+    h.db.close();
+  });
+
+  it('écrit un point d’equity par tick et un fee_usd sur chaque trade paper', async () => {
+    const h = harness({ signals: [buySignal()] });
+    h.prices.set(A, price(2));
+
+    const result = await h.engine.runOnce();
+
+    const equityRows = h.db
+      .prepare('SELECT mode, nav_usd, cash_usd, positions_value_usd, open_count FROM equity_curve')
+      .all() as unknown as Array<{
+      mode: string;
+      nav_usd: number;
+      cash_usd: number;
+      positions_value_usd: number;
+      open_count: number;
+    }>;
+    expect(equityRows).toHaveLength(1);
+    expect(equityRows[0]).toMatchObject({ mode: 'paper', open_count: 1 });
+    expect(equityRows[0]!.nav_usd).toBeCloseTo(result.navUsd, 6);
+
+    const trade = getRecentTrades(h.db)[0]!;
+    expect(trade.feeUsd).toBeGreaterThan(0);
+    h.db.close();
   });
 });

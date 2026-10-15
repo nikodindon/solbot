@@ -22,7 +22,13 @@ describe('toBaseUnitsFloor', () => {
 });
 
 describe('PaperBroker', () => {
-  const broker = new PaperBroker(20); // 20 bps de slippage modélisé
+  // 20 bps de slippage modélisé, pas d'impact ni de frais fixes.
+  const broker = new PaperBroker({
+    fillSlippageBps: 20,
+    impactK: 0,
+    priorityFeeSol: 0,
+    feeBpsOverride: null,
+  });
 
   it('achète avec frais (sur l’entrée) et slippage', () => {
     const fill = broker.buy({
@@ -71,5 +77,46 @@ describe('PaperBroker', () => {
     expect(fill.feeBps).toBe(2);
     expect(fill.feeUsd).toBeCloseTo(0.03, 10); // 150 $ × 2 bps
     expect(Number(fill.outAmount) / 10 ** 6).toBeCloseTo((150 - 0.03) / 1.002, 4);
+  });
+
+  it('applique le modèle d’impact k × notionnel / liquidité', () => {
+    const impacted = new PaperBroker({
+      fillSlippageBps: 0,
+      impactK: 0.5,
+      priorityFeeSol: 0,
+      feeBpsOverride: 0,
+    });
+    // Achat 100 $ dans un pool de 100 000 $ → impact = 0,5 × 100/100 000 = 5 bps.
+    const fill = impacted.buy({
+      spendBaseUnits: '100000000',
+      inputMint: USDC_MINT,
+      inputDecimals: 6,
+      outputMint: 'B'.repeat(44),
+      outputDecimals: 6,
+      priceUsd: 1,
+      liquidityUsd: 100_000,
+    });
+    expect(fill.effectivePriceUsd).toBeCloseTo(1.0005, 10);
+    expect(Number(fill.outAmount) / 10 ** 6).toBeCloseTo(100 / 1.0005, 5);
+  });
+
+  it('déduit le coût fixe (priority fee) et le forçage de frais', () => {
+    const fixed = new PaperBroker({
+      fillSlippageBps: 0,
+      impactK: 0,
+      priorityFeeSol: 0,
+      feeBpsOverride: 0,
+    });
+    const fill = fixed.sell({
+      qtyBaseUnits: '1000000',
+      tokenMint: 'B'.repeat(44),
+      tokenDecimals: 6,
+      outputMint: USDC_MINT,
+      outputDecimals: 6,
+      priceUsd: 2,
+      flatFeeUsd: 0.01,
+    });
+    expect(fill.flatFeeUsd).toBeCloseTo(0.01, 10);
+    expect(Number(fill.outAmount) / 10 ** 6).toBeCloseTo(1.99, 6);
   });
 });

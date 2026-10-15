@@ -173,6 +173,90 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE trades ADD COLUMN trigger TEXT;
     `,
   },
+  {
+    version: 4,
+    name: 'phase4_multi_strategies_backtest',
+    sql: `
+      -- Décision d'arbitrage inter-stratégies (candidats, gagnant, motif).
+      CREATE TABLE arbitrations (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts               INTEGER NOT NULL,
+        mint             TEXT NOT NULL,
+        symbol           TEXT NOT NULL,
+        side             TEXT NOT NULL,               -- buy | sell
+        chosen_strategy  TEXT,
+        chosen_score     REAL,
+        candidates       TEXT NOT NULL,               -- JSON [{ strategy, confidence, edgeBps, weight, score, chosen, reason }]
+        reason           TEXT NOT NULL                -- best_score | cap_reached | exit_priority | kill_switch | daily_loss_pause
+      );
+      CREATE INDEX idx_arbitrations_ts ON arbitrations (ts);
+
+      -- Courbe d'equity du moteur (un point par tick, tous modes).
+      CREATE TABLE equity_curve (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        mode                TEXT NOT NULL,
+        ts                  INTEGER NOT NULL,
+        nav_usd             REAL NOT NULL,
+        cash_usd            REAL NOT NULL,
+        positions_value_usd REAL NOT NULL,
+        open_count          INTEGER NOT NULL
+      );
+      CREATE INDEX idx_equity_curve_mode_ts ON equity_curve (mode, ts);
+
+      -- Bougies historiques importées (source externe, ex. GeckoTerminal).
+      CREATE TABLE imported_candles (
+        mint         TEXT NOT NULL,
+        timeframe    TEXT NOT NULL,
+        bucket_start INTEGER NOT NULL,
+        open         REAL NOT NULL,
+        high         REAL NOT NULL,
+        low          REAL NOT NULL,
+        close        REAL NOT NULL,
+        volume_usd   REAL NOT NULL DEFAULT 0,
+        source       TEXT NOT NULL,
+        imported_at  INTEGER NOT NULL,
+        PRIMARY KEY (mint, timeframe, bucket_start)
+      );
+
+      -- Runs de backtest : métriques, couverture, empreinte des paramètres.
+      -- Sert aussi de garde-fou : pas de live sans run concluant sur ces paramètres.
+      CREATE TABLE backtest_runs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at    INTEGER NOT NULL,
+        label         TEXT,
+        config_path   TEXT,
+        params_hash   TEXT NOT NULL,
+        strategies    TEXT NOT NULL,                  -- JSON (nom, poids, timeframe, params)
+        timeframe     TEXT NOT NULL,
+        from_ts       INTEGER NOT NULL,
+        to_ts         INTEGER NOT NULL,
+        days          REAL NOT NULL,
+        initial_usdc  REAL NOT NULL,
+        mints_count   INTEGER NOT NULL,
+        candles_count INTEGER NOT NULL,
+        trades_count  INTEGER NOT NULL,
+        conclusive    INTEGER NOT NULL DEFAULT 0,
+        metrics       TEXT NOT NULL,                  -- JSON
+        rejections    TEXT                            -- JSON (top règles de rejet)
+      );
+      CREATE INDEX idx_backtest_runs_hash ON backtest_runs (params_hash, conclusive);
+
+      CREATE TABLE backtest_equity (
+        run_id              INTEGER NOT NULL REFERENCES backtest_runs(id),
+        ts                  INTEGER NOT NULL,
+        nav_usd             REAL NOT NULL,
+        cash_usd            REAL NOT NULL,
+        positions_value_usd REAL NOT NULL
+      );
+      CREATE INDEX idx_backtest_equity_run ON backtest_equity (run_id, ts);
+
+      -- Frais modélisés (USD) par trade — renseigné en paper/backtest.
+      ALTER TABLE trades ADD COLUMN fee_usd REAL;
+
+      -- Mode d'origine d'une position (paper | dry_run | live) — rapports par mode.
+      ALTER TABLE positions ADD COLUMN mode TEXT;
+    `,
+  },
 ];
 
 /** Applique les migrations manquantes. Retourne le nombre de migrations appliquées. */

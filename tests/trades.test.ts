@@ -23,6 +23,7 @@ function record(overrides: Partial<TradeRecord> = {}): TradeRecord {
     router: 'metis',
     feeBps: 10,
     feeMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    feeUsd: null,
     priceImpact: -0.08,
     slippageBps: 50,
     realizedSlippageBps: 4,

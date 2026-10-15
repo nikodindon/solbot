@@ -119,7 +119,7 @@ robustesse progressivement (voir la [roadmap](#13-roadmap-avancée)).
 │         │          ┌─────────┴──────────┐           ▼                │
 │         │          │   Stratégies       │   ┌────────────────┐       │
 │         │          │  (plugins)         │   │   Executor     │       │
-│         │          │  momentum · grid   │   │  (Swap V2)     │       │
+│         │          │  momentum · mean    │   │  (Swap V2)     │       │
 │         │          │  dca · copy-trade  │   └───────┬────────┘       │
 │         │          └────────────────────┘           │                │
 │         ▼                                           ▼                │
@@ -153,7 +153,7 @@ robustesse progressivement (voir la [roadmap](#13-roadmap-avancée)).
 | Runtime | **Node.js 22 LTS** + **TypeScript 5.x** (`strict`) | Écosystème Solana le plus mature, typage fort pour un bot de trading. |
 | SDK Solana | **`@solana/web3.js` v1** (principal) · **`@solana/kit` v8+** (Phase 6, transactions v1) | web3.js reste le standard de facto ; kit est requis pour signer les transactions Solana v1 (SIMD-0385, 4096 bytes). |
 | Jupiter | Client REST maison typé sur **Swap V2** (`api.jup.ag/swap/v2`), **Price v3**, **Tokens v2** — validé par **zod** | `@jup-ag/api` cible l'ancienne API V1 (lite-api) en voie de retrait ; un client maison fin et typé est plus sûr et plus simple. |
-| CLI | `commander` | Commandes `init`, `doctor`, `balance`, `scan`, `price`, `watch`, `swap`, `start`, `backtest`, `status`. |
+| CLI | `commander` | Commandes `init`, `doctor`, `balance`, `scan`, `price`, `watch`, `swap`, `start`, `backtest`, `report`, `status`. |
 | Config | Fichier `.env` (parseur interne, zéro dépendance) + `config.yaml` + validation **`zod`** au boot | Fail-fast : configuration invalide = arrêt immédiat, surface minimale. |
 | Persistance | **`node:sqlite`** (SQLite intégré à Node 22 — zéro dépendance native) + migrations maison | Monoprocessus, zéro infra, aucun binaire à compiler. |
 | Logs | **`pino`** (JSON) avec redaction des secrets | Logs structurés, exploitables, jamais de clé privée. |
@@ -231,6 +231,9 @@ npm run solbot -- doctor          # vérifie RPC, clé API, solde, version
 npm run solbot -- scan            # construit la watchlist (univers filtré) → SQLite
 npm run solbot -- price SOL USDC  # prix en direct (Price v3) + paire implicite
 npm run solbot -- watch           # collecte ticks + bougies OHLCV en continu (Ctrl+C)
+npm run solbot -- backtest import --days 30        # importe l'historique OHLCV (GeckoTerminal)
+npm run solbot -- backtest --days 30 --label base  # rejoue le moteur réel (Phase 4)
+npm run solbot -- report --days 30                 # métriques + comparaison au dernier backtest
 npm run solbot -- swap SOL USDC 0.05 --dry-run   # swap simulé : vrai /order + simulation RPC, sans signature
 npm run solbot -- start --paper   # démarre le moteur en mode paper (Phase 3)
 ```
@@ -341,7 +344,10 @@ strategies:                # chaque stratégie est activable/paramétrable indé
   mean_reversion:
     enabled: false
     weight: 1.0
-    params: { z_entry: 2.0, z_exit: 0.5, window: 96 }
+    timeframe: 15m
+    # zscore : achat en survente (z ≤ -z_entry), sortie au retour à la moyenne (z ≥ -z_exit)
+    # grid : achats par paliers sous l'ancre (grid_step_pct × niveau, ≤ grid_levels), sortie à l'ancre
+    params: { window: 96, z_entry: 2.0, z_exit: 0.5, mode: zscore, grid_step_pct: 1.0, grid_levels: 5 }
   dca_rotation:
     enabled: false
     weight: 0.5
@@ -368,9 +374,25 @@ risk:                      # le RiskManager a toujours le dernier mot
 paper:                     # portefeuille virtuel (modes paper et dry-run)
   initial_usdc: 1000           # caisse virtuelle de départ (USD)
   fill_slippage_bps: 20        # slippage modélisé par fill (aller simple)
+  impact_k: 0                  # impact ≈ impact_k × notionnel / liquidité (0 = ignoré en paper)
+  priority_fee_sol: 0          # frais réseau + priority fee par swap (SOL) ; 0 = ignorés
+  fee_bps_override: null       # force un barème de frais (bps) au lieu du barème Jupiter par paire
 
 engine:                    # moteur autonome (`solbot start`)
   max_entries_per_tick: 1      # entrées max transmises au risque par tick (anti-rafale)
+
+backtest:                  # backtest offline (`solbot backtest`)
+  timeframe: 15m               # 1m | 5m | 15m | 1h
+  initial_usdc: 1000           # caisse virtuelle du run (indépendante du paper)
+  default_liquidity_usd: 250000 # liquidité de secours si la watchlist n'en fournit pas
+  costs:                       # coûts réalistes (DoD : écart backtest ≈ paper expliqué)
+    fill_slippage_bps: 10
+    impact_k: 0.5
+    priority_fee_sol: 0.00005
+    fee_bps_override: null
+  guard:                       # garde-fou live : pas de mode live sans backtest concluant
+    min_days: 30               # couverture minimale (jours) pour un run concluant
+    require_positive_net_pnl: false # true = exiger aussi un PnL net positif
 
 execution:
   path: meta_aggregator        # meta_aggregator (/order+/execute) | router (/build)
@@ -410,19 +432,25 @@ interface Signal {
   ttlMs: number;           // durée de validité du signal
   reason: string;          // journalisé pour audit
   suggestedStopLossPct?: number;
+  allowAdd?: boolean;      // autorise un ajout à une position existante (grille, DCA)
+  suggestedSizeUsd?: number; // plafond de taille suggéré — le RiskManager reste maître
+  sellPortion?: number;    // 0..1 — sortie partielle (défaut : toute la position)
 }
 ```
 
 Le **Signal Engine** collecte les signaux de toutes les stratégies activées, les pondère (`weight`),
-arbitre par score (`confiance × poids`) et ne transmet au RiskManager qu'un nombre limité d'actions
-par tick (`engine.max_entries_per_tick`, défaut 1 — anti-rafale, anti-churn). Les signaux actionnables
-sont journalisés en base (`signals`, avec `acted`) et les rejets sont tracés à part (`risk_rejections`).
+arbitre par **score composite** (`confiance × poids × facteur d'edge`, edge clampé à 200 bps → facteur
+∈ [1, 1.5]) et ne transmet au RiskManager qu'un nombre limité d'actions par tick
+(`engine.max_entries_per_tick`, défaut 1 — anti-rafale, anti-churn). Un conflit achat/vente sur le
+même actif est résolu en faveur de la **sortie** (`exit_priority`). Chaque décision d'arbitrage
+(gagnant, écartés, motif) est journalisée en base (`arbitrations`) ; les signaux actionnables le sont
+dans `signals` (avec `acted`) et les rejets dans `risk_rejections`.
 
 | Stratégie | Principe | Signaux produits | Statut |
 |---|---|---|---|
 | **momentum** | EMA rapide/lente + filtre RSI + cassure des plus hauts + confirmation volume ; stop initial basé ATR | Entrée long sur breakout confirmé ; sortie sur tendance EMA inverse | ✅ Phase 3 (implémentée) |
-| **mean_reversion** | Z-score du prix vs moyenne glissante (ou grille adaptative autour d'une ancre) | Entrée quand déviation > seuil ; sortie au retour à la moyenne | Phase 4 |
-| **dca_rotation** | Allocation cible (ex. 40 % SOL / 60 % USDC), rééquilibrage par dérive | Achats/ventes de rééquilibrage périodiques | Phase 4 |
+| **mean_reversion** | Z-score du prix vs moyenne glissante (mode `zscore`) ou grille de paliers sous une ancre (mode `grid`) ; sortie au retour à la moyenne/l'ancre | Entrée quand déviation > seuil (`allowAdd` en grille sous le prix moyen) ; sortie au retour | ✅ Phase 4 (implémentée) |
+| **dca_rotation** | Allocation cible (ex. 40 % SOL / 60 % USDC), rééquilibrage par dérive (une action par évaluation) | Achat de la cible sous-allouée (plafonné par `topup_usdc`) ; allègement de la cible sur-allouée (`sellPortion`) | ✅ Phase 4 (implémentée) |
 | **copy_trade** | Surveillance de wallets performants (logs RPC / webhooks), réplication contrainte par le risque | Réplication proportionnelle du swap détecté | Phase 7 |
 
 > 🧪 Toute nouvelle stratégie se développe et se valide d'abord en **backtest** puis en **paper mode**
@@ -456,8 +484,14 @@ Points de conception à connaître :
   dépassement de `daily_loss_limit_pct` → entrées en pause jusqu'à minuit UTC (sorties actives).
 - **Reprise après crash (live)** — au démarrage, les soldes on-chain (RPC) font foi : chaque position
   locale est adoptée, ajustée (FIFO) ou clôturée, et chaque décision est journalisée dans `events`.
-- **Journal** — `trades` (stratégie, déclencheur, mode), `signals`, `risk_rejections` (règle + métriques),
-  `events` : tout est en SQLite, dans `data/solbot.sqlite`.
+- **Actifs négociables** — à l'achat, seuls SOL et les actifs de la watchlist (∪ positions ouvertes)
+  sont négociables ; la devise de base est exclue des entrées.
+- **Ajouts & sorties partielles (Phase 4)** — une stratégie peut demander un **ajout** à une position
+  existante (`allowAdd: true`, ex. grille/DCA) ou une **sortie partielle** (`sellPortion: 0..1`) ; le
+  portefeuille FIFO gère les lots, les ajouts sont miroir en base.
+- **Journal** — `trades` (stratégie, déclencheur, mode), `signals`, `arbitrations`, `risk_rejections`
+  (règle + métriques), `events`, `equity_curve` (un point par tick) : tout est en SQLite, dans
+  `data/solbot.sqlite`.
 
 ---
 
@@ -528,24 +562,67 @@ Trois niveaux de validation avant le live :
 
 | Mode | Description | Phase |
 |---|---|---|
-| **Backtest** | Rejoue l'historique OHLCV stocké (ou importé) + modèle de coûts réaliste : frais Jupiter par paire, priority fees, slippage estimé (modèle impact = k × taille/liquidité). | 4 |
-| **Paper** | Le bot tourne en temps réel, réels appels API, **aucun ordre** : les "fills" sont simulés au prix courant + slippage modélisé. Table `paper_trades` séparée. | 3–4 |
+| **Backtest** | Rejoue le **moteur réel** (stratégies, RiskManager, portefeuille FIFO) sur l'historique OHLCV importé + collecté, un tick par clôture de bougie. | 4 |
+| **Paper** | Le bot tourne en temps réel, réels appels API, **aucun ordre** : les "fills" sont simulés au prix courant + coûts modélisés (`paper.*`), caisse virtuelle (`paper.initial_usdc`). | 3–4 |
 | **Dry-run** | Obtient de vrais `/order` et simule la transaction on-chain (`simulateTransaction`), détecte les échecs réalistes (slippage, comptes manquants), **sans signer ni envoyer**. | 2 |
 
-⚠️ Honnêteté méthodologique : les données historiques de qualité sont limitées (Price API v3 ne fournit
-que le spot actuel). Le bot **accumule ses propres ticks OHLCV en SQLite** dès la Phase 1 ; les backtests
-initiaux utilisent donc soit cette accumulation, soit un import externe (Birdeye, GeckoTerminal).
-Un backtest sur trop peu de données est signalé comme non concluant.
+### 11.1 Données : accumulation interne + import GeckoTerminal
 
-Métriques générées : PnL net (après tous frais), win rate, profit factor, turnover, max drawdown,
-Sharpe simplifié, et **slippage réalisé vs estimé** (le juge de paix de l'exécution).
+L'API Jupiter ne fournit que le prix spot. L'historique vient de deux sources :
+
+- l'**accumulation interne** (`solbot watch` / moteur) : bougies OHLCV maison (1m/5m/15m/1h) ;
+- l'**import externe** — `solbot backtest import --days N` interroge **GeckoTerminal** (API publique sans
+  clé) : pool principal (plus grande réserve USD) de chaque mint, OHLCV en USD, écrit dans
+  `imported_candles` avec sa source.
+
+À la lecture, les deux sources sont **fusionnées** : OHLC importé prioritaire sur la bougie live
+correspondante, volume live conservé quand l'import n'en a pas. Les tables restent séparées.
+
+### 11.2 Rejeu — `solbot backtest`
+
+```bash
+npm run solbot -- backtest import --days 30              # importe ~30 j d'OHLCV 15m
+npm run solbot -- backtest --days 30 --label momentum-base
+npm run solbot -- backtest --days 30 --label momentum-relaxe --config config/momentum-relaxe.yaml
+```
+
+Le rejeu utilise le **même moteur** que le live sur une base `:memory:` (seams injectés : bougies,
+horloge, coûts), un tick par clôture de bougie :
+
+- prix au tick = clôture de la dernière bougie **clôturée** ;
+- coûts du run = `backtest.costs` (slippage de fill, impact `k × notionnel / liquidité`, priority fee
+  convertie en USD via le prix SOL) — plus réalistes que les défauts du paper ;
+- `days` dérivé de `--from/--to` si `--days` est absent ; le run (métriques, rejets, courbe d'equity)
+  est stocké dans `backtest_runs` + `backtest_equity`, sauf `--no-store`.
+
+### 11.3 Métriques & rapport — `solbot report`
+
+`solbot report [--days N] [--mode paper|backtest|dry_run|live] [--telegram]` calcule depuis la base :
+**PnL net** (après frais), win rate, profit factor, **max drawdown**, **Sharpe simplifié** (clôtures
+quotidiennes), turnover, frais — et compare au dernier backtest enregistré du même jeu de stratégies
+(contexte du garde-fou). Les métriques non calculables valent `null` (jamais de valeur trompeuse).
+
+### 11.4 Garde-fou live (codé, Phase 4)
+
+**Aucune stratégie ne peut être activée en live sans backtest concluant.** `start --live` exige un run
+`conclusive` pour l'**empreinte** du jeu de stratégies (`paramsHash` = sha256 de la devise de base +
+descripteur des stratégies, poids et paramètres inclus) avec `days ≥ backtest.guard.min_days`
+(défaut 30) et, si `require_positive_net_pnl: true`, un PnL net positif. Modifier un paramètre change
+l'empreinte : le backtest doit être rejoué.
+
+⚠️ Honnêteté méthodologique : la profondeur d'historique dépend de l'âge des pools (l'import s'arrête
+où la source s'arrête) et la liquidité est supposée **statique** en backtest (colonne `liquidity_usd`
+de la watchlist, sinon `backtest.default_liquidity_usd`). Un backtest sur trop peu de données est
+signalé **non concluant** (`conclusive = false`).
 
 ---
 
 ## 12. Observabilité & état
 
 - **SQLite** (`data/solbot.sqlite`) — source de vérité locale :
-  `trades`, `paper_trades`, `positions`, `price_ticks`, `signals`, `risk_rejections`, `errors`, `daily_pnl`.
+  `watchlist`, `price_ticks`, `candles`, `imported_candles`, `positions`, `position_lots`, `trades`,
+  `signals`, `arbitrations`, `risk_rejections`, `events`, `equity_curve`, `bot_state`, `backtest_runs`,
+  `backtest_equity`.
 - **Réconciliation au démarrage** : l'état des positions est reconstruit depuis la **chaîne** (soldes réels via RPC) puis confronté à la base ; toute divergence est journalisée et notifiée — jamais de "position fantôme".
 - **Logs pino JSON** : un flux par décision (`signal`, `arbitrage`, `risk`, `order`, `execute`, `error`), rotation quotidienne.
 - **Telegram** (Phase 5) : notification d'exécution, d'erreur, rapport PnL quotidien ; commandes `/status`, `/positions`, `/pnl`, `/pause`, `/resume`, `/kill`.
@@ -563,7 +640,7 @@ Sharpe simplifié, et **slippage réalisé vs estimé** (le juge de paix de l'ex
 | 1 | v0.2.0 | Données de marché : Price v3, Tokens v2, SQLite, scan — ✅ **réalisée** | nul |
 | 2 | v0.3.0 | Premier swap : `/order` + `/execute`, dry-run, erreurs — ✅ **réalisée** | faible (manuel, montants choisis) |
 | 3 | v0.4.0 | Moteur autonome mono-stratégie + risque complet — ✅ **réalisée** | réel encadré |
-| 4 | v0.5.0 | Multi-stratégies + backtesting + paper complet | réel encadré |
+| 4 | v0.5.0 | Multi-stratégies + backtesting + paper complet — ✅ **réalisée** | réel encadré |
 | 5 | v0.6.0 | Production 24/7 : Docker, Telegram, métriques, backups | réel encadré |
 | 6 | v0.7.0 | Exécution avancée : `/build`, tx.jup.ag, Jito, v1 txs | réel avancé |
 | 7 | v1.0.0 | Intelligence & extensions : copy-trading, Trigger API, keystore | réel mature |
@@ -640,16 +717,50 @@ hors session (tmux/nohup), aucun signe de fuite ni position orpheline attendu.
 > 📌 Tant que le wallet n'est pas financé, `dry-run`/`live` restent inutilisables (chaque `/order` échoue
 > avec `errorCode 1`) : c'est le comportement attendu. Le mode `paper` fonctionne sans aucun fonds.
 
-### Phase 4 — Multi-stratégies & backtesting (v0.5.0)
+### Phase 4 — Multi-stratégies & backtesting (v0.5.0) — ✅ **réalisée**
 
-- [ ] Stratégie **mean-reversion** (z-score, fenêtre paramétrable) + option grille adaptative
-- [ ] Stratégie **DCA/rotation** (dérive vs allocation cible, rééquilibrage)
-- [ ] **Arbitrage inter-stratégies** : score composite, conflit résolu par confiance × edge × poids ; journalisation de la décision
-- [ ] **Backtester** offline : rejeu de ticks/OHLCV + modèle de coûts (frais par paire, priority fees, impact en k×taille/liquidité)
-- [ ] **Paper mode** de première classe : mêmes règles que live, table dédiée, rapport comparatif paper vs backtest
-- [ ] Rapport de métriques (PnL net, win rate, profit factor, Sharpe, max DD, turnover) en CLI et Telegram
+- [x] Stratégie **mean-reversion** : mode `zscore` (fenêtre + seuils paramétrables) et mode **grille** (paliers sous l'ancre, ajouts sous le prix moyen, sortie à l'ancre)
+- [x] Stratégie **DCA/rotation** : allocation cible (clés `SOL`/`USDC`/mint), dérive déclencheuse, `topup_usdc` ; une seule action par évaluation, allègement partiel au-delà de la cible
+- [x] **Arbitrage inter-stratégies** : score composite `confiance × poids × facteur d'edge`, conflit achat/vente résolu en faveur de la **sortie**, décision journalisée (`arbitrations`)
+- [x] **Ajouts & sorties partielles** : `allowAdd`, `suggestedSizeUsd`, `sellPortion` — le RiskManager reste maître de la taille ; SOL achetable (cible DCA)
+- [x] **Backtester** offline : rejeu du **moteur réel** sur base `:memory:` (seams bougies/horloge/coûts), un tick par clôture de bougie ; coûts `backtest.costs` (slippage, impact `k × notionnel / liquidité`, priority fee en SOL)
+- [x] **Import d'historique** : `backtest import` via GeckoTerminal (pool par réserve, OHLCV USD, retry 429) — table `imported_candles` distincte, fusion OHLC importé prioritaire
+- [x] **Paper mode de première classe** : mêmes règles que le live, courbe d'equity par tick (`equity_curve`), mode tracé sur positions/trades
+- [x] Rapport de métriques (PnL net, win rate, profit factor, Sharpe, max DD, turnover, frais) — CLI `solbot report` + envoi `--telegram`
+- [x] **Garde-fou live** : `start --live` exige un backtest `conclusive` pour l'empreinte du jeu de stratégies (`days ≥ backtest.guard.min_days`, PnL net positif en option)
 
-**DoD** : comparaison documentée de ≥ 2 jeux de paramètres par stratégie sur ≥ 30 jours de données ; le backtest de la stratégie momentum reproduit grossièrement le paper mode de la Phase 3 (écart expliqué par les coûts) ; aucune stratégie ne peut être activée en live sans passer par le backtest (garde-fou codé).
+**DoD** (état au 15/10/2026) : ✅ **≥ 2 jeux de paramètres par stratégie sur ≥ 30 j**, rejoués avec le **moteur réel**
+(caisse 1 000 $, 15 m, import GeckoTerminal de 30 j, 12 mints liquides + USDC pour la cotation, coûts `backtest.costs`
+par défaut : slippage de fill 10 bps, impact `0.5 × notionnel / liquidité`, priority fee 0.00005 SOL). Fenêtre
+15/09 → 15/10/2026, ~32 000 bougies et 2 880 ticks par run ; les 6 runs sont **enregistrés** (`backtest_runs`, label +
+`paramsHash`, `days = 30.0` ≥ `backtest.guard.min_days`) :
+
+| # | Étiquette | Stratégie & paramètres | Net | Win rate | PF | DD max | Sharpe | Frais | Entrées |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `momentum-base` | momentum (RSI 65, volume ×1.5) | **+2.55 %** | 31.1 % | 1.19 | 3.86 % | 2.46 | 20.63 $ | 185 |
+| 2 | `momentum-relax` | momentum (RSI 70, volume ×1.2) | −0.62 % | 30.9 % | 0.94 | 6.25 % | −0.42 | 27.71 $ | 255 |
+| 3 | `meanrev-z2` | MR `zscore` (z 2.0 / 0.5) | −2.57 % | 56.6 % | 0.80 | 5.73 % | −2.33 | 20.25 $ | 196 |
+| 4 | `meanrev-z15` | MR `zscore` (z 1.5 / 0.5) | −3.88 % | 56.3 % | 0.78 | 5.74 % | −3.31 | 32.18 $ | 311 |
+| 5 | `dca-ab` | DCA (40 % SOL / 60 % caisse, dérive 5 %, topup 25 $) | +0.12 % | 60.0 % | 1.06 | 1.21 % | 1.01 | 0.27 $ | 23 |
+| 6 | `dca-b` | DCA (50/50, dérive 10 %, topup 50 $) | +0.18 % | 60.0 % | 1.11 | 1.18 % | 1.14 | 0.24 $ | 17 |
+
+Lecture honnête — **une seule fenêtre de marché, non prédictive** : le momentum de base gagne (+2.55 %, PF 1.19) mais le
+jeu « relaxé » perd (255 entrées vs 185, frais 27.71 $ vs 20.63 $, PF 0.94) ; la mean-reversion gagne la majorité de ses
+trades (56 %) mais son PF < 1 : quelques pertes dépassent les gains et les allers-retours sont mangés par les coûts ; le
+DCA/rotation reste quasi à plat (rotation faible, dérive rarement au-delà du seuil).
+
+⏳ **Comparaison paper Phase 3** : le run paper 48 h (code v0.4.0 — pas de courbe `equity_curve`, comparaison via le
+journal et la table `trades`) se termine le **17/10/2026 vers 15:44 UTC** ; la comparaison `momentum-base` vs paper sera
+consignée ici. Écart attendu et déjà documenté : coûts modélisés du backtest (frais Jupiter par paire, priority fee,
+impact liquidité) et fills paper **au tick** vs clôture de bougie en backtest.
+
+✅ **Garde-fou live vérifié en réel** (`start --live --once --yes`, home isolé) : paramètres sans backtest →
+`live bloqué` (code 1) avec la marche à suivre ; run de référence perdant + `require_positive_net_pnl: true` → bloqué ;
+`momentum-base` + `confirm_live: true` → ✅ `run #1 · 30.0 j · +25.49 $ · empreinte 2a4b91ca`, puis 1 tick live sur
+wallet vide (0 ordre — le drawdown kill-switch se déclenche avec un NAV à 0, comportement attendu).
+
+🧪 **242 tests** (stratégies + arbitrage inter-stratégies, backtester bout-en-bout, import GeckoTerminal avec retry 429,
+garde-fou, rapport de métriques, routage CLI `backtest`/`import`).
 
 ### Phase 5 — Production 24/7 (v0.6.0)
 

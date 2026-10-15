@@ -42,7 +42,11 @@ strategies: # chaque stratégie est activable/paramétrable indépendamment
   mean_reversion:
     enabled: false
     weight: 1.0
-    params: { z_entry: 2.0, z_exit: 0.5, window: 96 }
+    timeframe: 15m
+    # zscore : achat en survente (z ≤ -z_entry), sortie au retour à la moyenne (z ≥ -z_exit)
+    # grid : achats par paliers sous l'ancre (grid_step_pct × niveau, ≤ grid_levels), sortie à l'ancre
+    params:
+      { window: 96, z_entry: 2.0, z_exit: 0.5, mode: zscore, grid_step_pct: 1.0, grid_levels: 5 }
   dca_rotation:
     enabled: false
     weight: 0.5
@@ -69,9 +73,25 @@ risk: # le RiskManager a toujours le dernier mot
 paper: # portefeuille virtuel (modes paper et dry-run)
   initial_usdc: 1000 # caisse virtuelle de départ (USD)
   fill_slippage_bps: 20 # slippage modélisé par fill (aller simple)
+  impact_k: 0 # impact ≈ impact_k × notionnel / liquidité (0 = ignoré en paper)
+  priority_fee_sol: 0 # priority fee + frais réseau par swap en SOL (0 = ignoré)
+  fee_bps_override: null # force le barème de frais (bps) au lieu du barème Jupiter par paire
 
 engine: # moteur autonome (`solbot start`)
   max_entries_per_tick: 1 # entrées max transmises au risque par tick (anti-rafale)
+
+backtest: # backtest offline (`solbot backtest`) — rejoue le moteur réel sur l'historique
+  timeframe: 15m # 1m | 5m | 15m | 1h
+  initial_usdc: 1000 # caisse virtuelle du run (indépendante du paper)
+  default_liquidity_usd: 250000 # liquidité de secours si la watchlist n'en fournit pas
+  costs: # coûts plus réalistes que le paper (DoD : écart backtest ≈ paper expliqué)
+    fill_slippage_bps: 10
+    impact_k: 0.5
+    priority_fee_sol: 0.00005
+    fee_bps_override: null
+  guard: # garde-fou live : aucun mode live sans backtest concluant
+    min_days: 30 # couverture minimale (jours de données) pour un run concluant
+    require_positive_net_pnl: false # true = exiger aussi un PnL net positif
 
 execution:
   path: meta_aggregator # meta_aggregator (/order+/execute) | router (/build)

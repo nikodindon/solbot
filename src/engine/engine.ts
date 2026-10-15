@@ -1,11 +1,12 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { SOL_MINT, USDC_MINT } from '../constants.js';
 import type { Executor } from '../execution/executor.js';
-import { PaperBroker, toBaseUnitsFloor } from '../execution/paper-broker.js';
+import { PaperBroker, toBaseUnitsFloor, type PaperCosts } from '../execution/paper-broker.js';
 import { TIMEFRAMES, type Timeframe } from '../market/ohlcv.js';
 import type { PollSummary } from '../market/poller.js';
 import { Portfolio, type PortfolioSnapshot } from '../portfolio/portfolio.js';
-import { RiskManager, type RiskContext } from '../risk/risk-manager.js';
+import { MIN_NOTIONAL_USD, RiskManager, type RiskContext } from '../risk/risk-manager.js';
+import { insertArbitration, type ArbitrationCandidate } from '../state/arbitrations.js';
 import {
   deleteState,
   getNumberState,
@@ -14,6 +15,7 @@ import {
   setState,
   STATE_KEYS,
 } from '../state/bot-state.js';
+import { insertEquityPoint } from '../state/equity.js';
 import { insertEvent } from '../state/events.js';
 import { getCandles, type Candle } from '../state/market-data.js';
 import {
@@ -26,6 +28,7 @@ import {
 import { insertSignal, markSignalActed } from '../state/signals.js';
 import { insertTrade, annotateTrade, lastTradeTsForMint } from '../state/trades.js';
 import { getWatchlist } from '../state/watchlist.js';
+import { rankSignals, type RankedGroup } from '../strategy/arbitration.js';
 import {
   closedCandles,
   type AssetSnapshot,
@@ -58,6 +61,10 @@ export interface EngineDeps {
   ) => Promise<{ baseUsd: number; solBalanceSol: number }>;
   /** Fichier STOP (kill-switch manuel et drawdown max). */
   stopFile: { exists: () => boolean; createIfAbsent: () => void };
+  /** Coûts paper (défaut : bloc `paper` de la config) — surchargés par le backtest. */
+  costs?: PaperCosts;
+  /** Source d'historique des bougies (défaut : base locale) — rejeu du backtest. */
+  getCandles?: (mint: string, timeframe: Timeframe, limit: number) => Candle[];
   clock?: () => number;
   onLog?: (line: string) => void;
 }
@@ -110,6 +117,7 @@ export class Engine {
   private readonly portfolio: Portfolio;
   private readonly risk: RiskManager;
   private readonly broker: PaperBroker;
+  private readonly paperCosts: PaperCosts;
   private stopRequested = false;
   private tradeInFlight = false;
   /** Variation de caisse (USD) des trades exécutés pendant le tick courant — live. */
@@ -127,7 +135,14 @@ export class Engine {
     }
     this.portfolio = new Portfolio(deps.db);
     this.risk = new RiskManager(deps.db, deps.config);
-    this.broker = new PaperBroker(deps.config.paper.fill_slippage_bps);
+    const paper = deps.config.paper;
+    this.paperCosts = deps.costs ?? {
+      fillSlippageBps: paper.fill_slippage_bps,
+      impactK: paper.impact_k,
+      priorityFeeSol: paper.priority_fee_sol,
+      feeBpsOverride: paper.fee_bps_override,
+    };
+    this.broker = new PaperBroker(this.paperCosts);
   }
 
   requestStop(): void {
@@ -323,7 +338,7 @@ export class Engine {
 
     // ── 4. Signaux des stratégies (une évaluation par tick) ────────────────
     const assetList = buildAssetList(watchlist, startPositions);
-    const market = this.buildMarket(assetList, poll, ts);
+    const market = this.buildMarket(assetList, poll, ts, snapshot);
     const produced = this.evaluateStrategies(market);
 
     const actionableSells: ProducedSignal[] = [];
@@ -332,12 +347,13 @@ export class Engine {
       const { signal } = item;
       if (signal.side === 'sell') {
         if (heldMints.has(signal.assetMint)) actionableSells.push(item);
-      } else if (
-        !heldMints.has(signal.assetMint) &&
-        watchlistMints.has(signal.assetMint) &&
-        signal.assetMint !== base.mint &&
-        signal.assetMint !== SOL_MINT
-      ) {
+      } else {
+        if (signal.assetMint === base.mint) continue;
+        const tradable = watchlistMints.has(signal.assetMint) || signal.assetMint === SOL_MINT;
+        if (!tradable) continue;
+        // Ajout à une position existante : uniquement si la stratégie l'autorise
+        // explicitement (grille, DCA) — jamais d'empilement silencieux.
+        if (heldMints.has(signal.assetMint) && signal.allowAdd !== true) continue;
         actionableBuys.push(item);
       }
     }
@@ -345,10 +361,65 @@ export class Engine {
       item.id = this.recordSignal(item, ts);
     }
 
+    // ── 4b. Arbitrage inter-stratégies (score = confiance × poids × edge) ──
+    const sellGroups = rankSignals(
+      actionableSells.map((item) => ({
+        strategy: item.strategy,
+        weight: this.deps.weights.get(item.strategy) ?? 1,
+        signal: item.signal,
+      })),
+    );
+    const buyGroups = rankSignals(
+      actionableBuys.map((item) => ({
+        strategy: item.strategy,
+        weight: this.deps.weights.get(item.strategy) ?? 1,
+        signal: item.signal,
+      })),
+    );
+    const winnerOf = (items: ProducedSignal[], group: RankedGroup): ProducedSignal | undefined =>
+      items.find((item) => item.signal === group.candidates[0]?.signal);
+    const sellByMint = new Map<string, { winner: ProducedSignal; group: RankedGroup }>();
+    for (const group of sellGroups) {
+      const winner = winnerOf(actionableSells, group);
+      if (winner !== undefined) sellByMint.set(group.mint, { winner, group });
+    }
+    /** Journalise la décision d'arbitrage d'un groupe (gagnant + écartés). */
+    const journalGroup = (group: RankedGroup, reason: string, chosen: boolean): void => {
+      const top = group.candidates[0];
+      const candidates: ArbitrationCandidate[] = group.candidates.map((candidate, index) => ({
+        strategy: candidate.strategy,
+        confidence: candidate.signal.confidence,
+        edgeBps: candidate.signal.edgeEstimateBps ?? null,
+        weight: candidate.weight,
+        score: candidate.score,
+        chosen: chosen && index === 0,
+        reason: chosen
+          ? index === 0
+            ? 'best_score'
+            : 'lower_score'
+          : index === 0
+            ? reason
+            : 'lower_score',
+      }));
+      insertArbitration(db, {
+        ts,
+        mint: group.mint,
+        symbol: group.symbol,
+        side: group.side,
+        chosenStrategy: chosen ? (top?.strategy ?? null) : null,
+        chosenScore: chosen ? (top?.score ?? null) : null,
+        candidates,
+        reason,
+      });
+    };
+
     // ── 5. Sorties : la garde de sortie a priorité sur toute entrée ────────
     const exits: string[] = [];
     const rejections: string[] = [];
-    const sellSignals = new Map(actionableSells.map((item) => [item.signal.assetMint, item]));
+
+    for (const { group } of sellByMint.values()) {
+      journalGroup(group, 'best_score', true);
+    }
 
     for (const position of startPositions) {
       const price = prices.get(position.mint) ?? null;
@@ -357,7 +428,8 @@ export class Engine {
         this.log(`sortie ${position.symbol} reportée : prix ${base.symbol} indisponible`);
         continue;
       }
-      const plan = this.exitPlan(position, price, sellSignals.get(position.mint), ts);
+      const arbitrated = sellByMint.get(position.mint);
+      const plan = this.exitPlan(position, price, arbitrated?.winner, ts);
       if (plan === null) continue;
 
       const decision = this.risk.checkExit(
@@ -366,7 +438,7 @@ export class Engine {
           symbol: position.symbol,
           strategy: plan.strategy,
           trigger: plan.trigger,
-          qtyBaseUnits: position.qtyRemaining,
+          qtyBaseUnits: plan.qtyBaseUnits,
           priceUsd: price,
         },
         this.buildRiskContext({ ts, snapshot, solBalanceSol }),
@@ -377,47 +449,58 @@ export class Engine {
         continue;
       }
       if (plan.signalId !== undefined) markSignalActed(db, plan.signalId);
+      const info = poll.prices.get(position.mint);
       const line = await this.executeExit(
         position,
         plan.trigger,
         plan.strategy,
         price,
         basePriceUsd,
+        plan.qtyBaseUnits,
+        info?.liquidityUsd ?? null,
+        solPriceUsd,
       );
       if (line !== null) exits.push(line);
     }
 
     // ── 6. Entrées : arbitrage puis contrôles de risque ────────────────────
     const entries: string[] = [];
-    if (killSwitch) {
-      if (actionableBuys.length > 0) {
+    if (killSwitch || (pausedUntilMs !== null && pausedUntilMs > ts)) {
+      if (buyGroups.length > 0) {
         rejections.push(
-          `entrées coupées (kill-switch actif) : ${actionableBuys.length} signal(aux) ignoré(s)`,
+          killSwitch
+            ? `entrées coupées (kill-switch actif) : ${buyGroups.length} signal(aux) ignoré(s)`
+            : `entrées en pause (perte journalière) : ${buyGroups.length} signal(aux) ignoré(s)`,
         );
-      }
-    } else if (pausedUntilMs !== null && pausedUntilMs > ts) {
-      if (actionableBuys.length > 0) {
-        rejections.push(
-          `entrées en pause (perte journalière) : ${actionableBuys.length} signal(aux) ignoré(s)`,
-        );
+        for (const group of buyGroups) {
+          journalGroup(group, killSwitch ? 'kill_switch' : 'daily_loss_pause', false);
+        }
       }
     } else {
-      const candidates = actionableBuys
-        .map((item) => ({
-          item,
-          score: item.signal.confidence * (this.deps.weights.get(item.strategy) ?? 1),
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, config.engine.max_entries_per_tick);
-
-      const lastTradeTsByMint = new Map<string, number>();
-      for (const candidate of candidates) {
-        const lastTs = lastTradeTsForMint(db, candidate.item.signal.assetMint);
-        if (lastTs !== null) lastTradeTsByMint.set(candidate.item.signal.assetMint, lastTs);
+      const chosen: RankedGroup[] = [];
+      for (const group of buyGroups) {
+        if (sellByMint.has(group.mint)) {
+          // Conflit achat/vente sur un même actif : la sortie prime (README section 8).
+          journalGroup(group, 'exit_priority', false);
+          continue;
+        }
+        if (chosen.length >= config.engine.max_entries_per_tick) {
+          journalGroup(group, 'cap_reached', false);
+          continue;
+        }
+        journalGroup(group, 'best_score', true);
+        chosen.push(group);
       }
 
-      for (const candidate of candidates) {
-        const { item } = candidate;
+      const lastTradeTsByMint = new Map<string, number>();
+      for (const group of chosen) {
+        const lastTs = lastTradeTsForMint(db, group.mint);
+        if (lastTs !== null) lastTradeTsByMint.set(group.mint, lastTs);
+      }
+
+      for (const group of chosen) {
+        const item = winnerOf(actionableBuys, group);
+        if (item === undefined) continue;
         const mint = item.signal.assetMint;
         const info = poll.prices.get(mint);
         const price = prices.get(mint) ?? 0;
@@ -436,7 +519,19 @@ export class Engine {
           rejections.push(`entrée ${item.signal.symbol} refusée : ${decision.message}`);
           continue;
         }
-        const line = await this.executeEntry(item, decision.sizeUsd, price, poll, solPriceUsd);
+        // Plafond suggéré par la stratégie (DCA/grille) : borné par le risque.
+        let sizeUsd = decision.sizeUsd;
+        const hint = item.signal.suggestedSizeUsd;
+        if (hint !== undefined) {
+          sizeUsd = Math.min(sizeUsd, hint);
+          if (sizeUsd < MIN_NOTIONAL_USD) {
+            this.log(
+              `entrée ${item.signal.symbol} ignorée : plafond stratégie ${hint.toFixed(2)} $ sous le minimum`,
+            );
+            continue;
+          }
+        }
+        const line = await this.executeEntry(item, sizeUsd, price, poll, solPriceUsd);
         if (line !== null) entries.push(line);
       }
     }
@@ -446,10 +541,15 @@ export class Engine {
     // sur le snapshot d'entrée de tick).
     const finalCashUsd =
       mode === 'live' ? Math.max(0, cashUsd + this.tickCashDeltaUsd) : this.virtualCash();
-    const finalSnapshot = this.portfolio.snapshot({
+    const finalTs = this.now();
+    const finalSnapshot = this.portfolio.snapshot({ cashUsd: finalCashUsd, prices, ts: finalTs });
+    insertEquityPoint(db, {
+      mode,
+      ts: finalTs,
+      navUsd: finalSnapshot.navUsd,
       cashUsd: finalCashUsd,
-      prices,
-      ts: this.now(),
+      positionsValueUsd: finalSnapshot.positionsValueUsd,
+      openCount: finalSnapshot.openCount,
     });
 
     return {
@@ -522,6 +622,19 @@ export class Engine {
     );
   }
 
+  /** Priority fee modélisé (USD) d'un swap, converti depuis SOL. */
+  private tradeFlatFeeUsd(solPriceUsd: number | null): number {
+    const feeSol = this.paperCosts.priorityFeeSol;
+    if (!(feeSol > 0) || solPriceUsd === null || !(solPriceUsd > 0)) return 0;
+    return feeSol * solPriceUsd;
+  }
+
+  /** Historique des bougies : base locale par défaut, source injectée en backtest. */
+  private candleHistory(mint: string, timeframe: Timeframe, limit: number): Candle[] {
+    if (this.deps.getCandles !== undefined) return this.deps.getCandles(mint, timeframe, limit);
+    return getCandles(this.deps.db, mint, timeframe, limit);
+  }
+
   private recordSignal(item: ProducedSignal, ts: number): number {
     const { signal } = item;
     return insertSignal(this.deps.db, {
@@ -555,8 +668,8 @@ export class Engine {
     assets: Array<{ mint: string; symbol: string }>,
     poll: PollSummary,
     ts: number,
+    snapshot: PortfolioSnapshot,
   ): MarketSnapshot {
-    const { db } = this.deps;
     const needed = new Map<Timeframe, number>();
     for (const strategy of this.deps.strategies) {
       for (const requirement of strategy.requiredData) {
@@ -570,7 +683,7 @@ export class Engine {
     const snapshots: AssetSnapshot[] = assets.map((asset) => {
       const candles: Partial<Record<Timeframe, Candle[]>> = {};
       for (const [timeframe, limit] of needed) {
-        candles[timeframe] = getCandles(db, asset.mint, timeframe, limit);
+        candles[timeframe] = this.candleHistory(asset.mint, timeframe, limit);
       }
       const info = poll.prices.get(asset.mint);
       return {
@@ -581,7 +694,22 @@ export class Engine {
         candles,
       };
     });
-    return { ts, assets: snapshots };
+    const portfolio = {
+      navUsd: snapshot.navUsd,
+      cashUsd: snapshot.cashUsd,
+      valueByMint: new Map(snapshot.positions.map((view) => [view.mint, view.valueUsd])),
+      positionsByMint: new Map(
+        snapshot.positions.map((view) => [
+          view.mint,
+          {
+            qtyRemaining: view.qtyRemaining,
+            decimals: view.decimals,
+            avgEntryPriceUsd: view.avgEntryPriceUsd,
+          },
+        ]),
+      ),
+    };
+    return { ts, assets: snapshots, portfolio };
   }
 
   private readyAssets(market: MarketSnapshot, ts: number, watchlistMints: Set<string>): number {
@@ -607,9 +735,9 @@ export class Engine {
   private exitPlan(
     position: PositionRow,
     price: number,
-    sellSignal: ProducedSignal | undefined,
+    arbitrated: ProducedSignal | undefined,
     ts: number,
-  ): { trigger: string; strategy: string; signalId?: number } | null {
+  ): { trigger: string; strategy: string; signalId?: number; qtyBaseUnits: string } | null {
     const { db, config } = this.deps;
     const entry = position.avgEntryPriceUsd;
     const peakBefore = position.peakPriceUsd ?? entry;
@@ -631,16 +759,21 @@ export class Engine {
 
     if (stop !== null && price <= stop) {
       const trailing = trailingStop !== null && stop === trailingStop;
-      return { trigger: trailing ? 'trailing_stop' : 'stop_loss', strategy: 'risk' };
+      return {
+        trigger: trailing ? 'trailing_stop' : 'stop_loss',
+        strategy: 'risk',
+        qtyBaseUnits: position.qtyRemaining,
+      };
     }
     if (position.takeProfitPriceUsd !== null && price >= position.takeProfitPriceUsd) {
-      return { trigger: 'take_profit', strategy: 'risk' };
+      return { trigger: 'take_profit', strategy: 'risk', qtyBaseUnits: position.qtyRemaining };
     }
-    if (sellSignal !== undefined) {
+    if (arbitrated !== undefined) {
       return {
-        trigger: 'momentum_exit',
-        strategy: sellSignal.strategy,
-        ...(sellSignal.id === undefined ? {} : { signalId: sellSignal.id }),
+        trigger: `${arbitrated.strategy}_exit`,
+        strategy: arbitrated.strategy,
+        ...(arbitrated.id === undefined ? {} : { signalId: arbitrated.id }),
+        qtyBaseUnits: sellQuantity(position, arbitrated.signal.sellPortion),
       };
     }
     return null;
@@ -692,6 +825,8 @@ export class Engine {
           outputMint: mint,
           outputDecimals: decimals,
           priceUsd,
+          liquidityUsd: info.liquidityUsd,
+          flatFeeUsd: this.tradeFlatFeeUsd(solPriceUsd),
         });
         if (BigInt(fill.outAmount) <= 0n) return null;
         qtyBaseUnits = fill.outAmount;
@@ -717,6 +852,7 @@ export class Engine {
           createdAt: this.now(),
           strategy: item.strategy,
           trigger: 'entry',
+          feeUsd: fill.feeUsd + fill.flatFeeUsd,
         });
       } else {
         const outcome = await this.deps.executor!.swap(
@@ -757,6 +893,7 @@ export class Engine {
         ts: this.now(),
         stopLossPriceUsd: entryPriceUsd * (1 - stopPct / 100),
         takeProfitPriceUsd: entryPriceUsd * (1 + tpPct / 100),
+        mode,
       });
       insertEvent(db, {
         level: 'info',
@@ -775,10 +912,12 @@ export class Engine {
     strategy: string,
     priceUsd: number,
     basePriceUsd: number,
+    qtyBaseUnits: string,
+    liquidityUsd: number | null,
+    solPriceUsd: number | null,
   ): Promise<string | null> {
     const { db, mode } = this.deps;
     const base = this.base();
-    const qtyBaseUnits = position.qtyRemaining;
     const qtyFloat = qtyToFloat(qtyBaseUnits, position.decimals);
     if (qtyFloat <= 0) return null;
 
@@ -795,6 +934,8 @@ export class Engine {
           outputDecimals: base.decimals,
           outputPriceUsd: basePriceUsd,
           priceUsd,
+          liquidityUsd,
+          flatFeeUsd: this.tradeFlatFeeUsd(solPriceUsd),
         });
         proceedsUsd = (Number(fill.outAmount) / 10 ** base.decimals) * basePriceUsd;
         this.addVirtualCash(proceedsUsd);
@@ -819,6 +960,7 @@ export class Engine {
           createdAt: this.now(),
           strategy,
           trigger,
+          feeUsd: fill.feeUsd + fill.flatFeeUsd,
         });
       } else {
         const outcome = await this.deps.executor!.swap(
@@ -891,6 +1033,15 @@ export class Engine {
   }
 }
 
+/** Quantité d'une sortie partielle : portion de la position restante (≥ 1 unité). */
+function sellQuantity(position: PositionRow, portion: number | undefined): string {
+  if (portion === undefined || portion >= 1) return position.qtyRemaining;
+  const remaining = BigInt(position.qtyRemaining);
+  const raw = BigInt(Math.floor(Number(remaining) * Math.min(1, Math.max(0.01, portion))));
+  const qty = raw < 1n ? 1n : raw > remaining ? remaining : raw;
+  return qty.toString();
+}
+
 /** Sélection de la quantité de sortie d'un swap (réel ou simulé). */
 function pickOutputAmount(outcome: {
   order: { totalOutputAmount?: string | null | undefined; outAmount?: string | undefined };
@@ -908,6 +1059,8 @@ const TRIGGER_LABELS: Record<string, string> = {
   take_profit: 'take-profit',
   trailing_stop: 'trailing stop',
   momentum_exit: 'sortie momentum',
+  mean_reversion_exit: 'sortie mean-reversion',
+  dca_rotation_exit: 'allègement rotation',
 };
 
 function buildAssetList(

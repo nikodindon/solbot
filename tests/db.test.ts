@@ -19,22 +19,27 @@ function memoryDb() {
 describe('migrations', () => {
   it('applique les migrations une seule fois et_versionne', () => {
     const db = openDatabase(':memory:');
-    expect(runMigrations(db)).toBe(3);
+    expect(runMigrations(db)).toBe(4);
     expect(runMigrations(db)).toBe(0);
-    expect(currentSchemaVersion(db)).toBe(3);
+    expect(currentSchemaVersion(db)).toBe(4);
     expect(currentSchemaVersion(openDatabase(':memory:'))).toBe(0);
     db.close();
   });
 
-  it('crée les tables du moteur (v3)', () => {
+  it('crée les tables du moteur (v3) et de la Phase 4 (v4)', () => {
     const db = memoryDb();
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
       .all()
       .map((row) => (row as unknown as { name: string }).name);
     for (const table of [
+      'arbitrations',
+      'backtest_equity',
+      'backtest_runs',
       'bot_state',
+      'equity_curve',
       'events',
+      'imported_candles',
       'position_lots',
       'positions',
       'risk_rejections',
@@ -51,7 +56,12 @@ describe('migrations', () => {
       .prepare('PRAGMA table_info(trades)')
       .all()
       .map((row) => (row as unknown as { name: string }).name);
-    expect(tradeColumns).toEqual(expect.arrayContaining(['strategy', 'trigger']));
+    expect(tradeColumns).toEqual(expect.arrayContaining(['strategy', 'trigger', 'fee_usd']));
+    const positionColumns = db
+      .prepare('PRAGMA table_info(positions)')
+      .all()
+      .map((row) => (row as unknown as { name: string }).name);
+    expect(positionColumns).toContain('mode');
     db.close();
   });
 });
