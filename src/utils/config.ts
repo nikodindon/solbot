@@ -168,18 +168,35 @@ const RouterSchema = z.strictObject({
   cu_price_cap_microlamports: z.number().int().min(0).default(0),
   /** Tip ajouté par `/build` en lamports (0 = aucun ; 1 000 000 = 0,001 SOL). */
   tip_lamports: z.number().int().min(0).default(0),
-  /** Tip taillé pour un bundle Jito (atterrissage Jito prévu en sous-étape 6b). */
+  /**
+   * Cible d'atterrissage du chemin Router (Phase 6b) : `rpc` (notre nœud),
+   * `tx_jup` (infra Jupiter, tip ≥ 0,001 SOL) ou `jito` (bundles Jito).
+   */
+  landing: z.enum(['rpc', 'tx_jup', 'jito']).default('rpc'),
+  /** Tip taillé pour un bundle Jito (imposé automatiquement si `landing: jito`). */
   for_jito_bundle: z.boolean().default(false),
 });
 
+/** Réglages de la bascule automatique de chemin (`execution.path: auto`) — Phase 6b. */
+const AutoPathSchema = z.strictObject({
+  /** Fenêtre glissante des statistiques live (jours). */
+  window_days: z.number().int().min(1).max(90).default(7),
+  /** Swaps live minimum par chemin avant de comparer. */
+  min_samples: z.number().int().min(1).max(1000).default(20),
+  /** Écart de taux de landing exigé pour basculer (0,02 = 2 points). */
+  rate_margin: z.number().min(0).max(0.5).default(0.02),
+});
+
 const ExecutionSchema = z.strictObject({
-  path: z.enum(['meta_aggregator', 'router']).default('meta_aggregator'),
+  path: z.enum(['meta_aggregator', 'router', 'auto']).default('meta_aggregator'),
   slippage: z.union([z.literal('rtse'), z.number().int().min(1).max(5000)]).default('rtse'),
   exclude_routers: z.array(z.enum(['jupiterz', 'dflow', 'okx'])).default([]),
   retries: z.number().int().min(0).max(10).default(3),
   retry_backoff_ms: z.number().int().min(50).max(60_000).default(750),
   confirm_timeout_s: z.number().int().min(5).max(300).default(60),
   router: RouterSchema.default(RouterSchema.parse({})),
+  /** Bascule automatique (`path: auto`) — ignoré sinon. */
+  auto: AutoPathSchema.default(AutoPathSchema.parse({})),
 });
 
 const TelegramSchema = z.strictObject({

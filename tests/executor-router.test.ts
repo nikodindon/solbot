@@ -1,19 +1,30 @@
+import type { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it, vi } from 'vitest';
 import bs58 from 'bs58';
-import { Keypair, type Transaction, type VersionedTransaction } from '@solana/web3.js';
+import {
+  Keypair,
+  SystemProgram,
+  TransactionMessage,
+  VersionedTransaction,
+  type PublicKey,
+  type Transaction,
+} from '@solana/web3.js';
 import { Executor, type SimulateTransaction } from '../src/execution/executor.js';
 import { ROUTER_CODES } from '../src/execution/router.js';
 import { JupiterApiError } from '../src/jupiter/errors.js';
 import {
   BuildResponseSchema,
+  OrderResponseSchema,
   type BuildParams,
   type BuildResponse,
+  type OrderParams,
+  type OrderResponse,
   type SwapApi,
 } from '../src/jupiter/swap.js';
 import type { LandingConfirmation, LandingTarget } from '../src/solana/landing.js';
 import { openDatabase } from '../src/state/db.js';
 import { runMigrations } from '../src/state/migrations.js';
-import { getRecentTrades } from '../src/state/trades.js';
+import { getRecentTrades, insertTrade, type TradeRecord } from '../src/state/trades.js';
 import { parseConfig, type Config } from '../src/utils/config.js';
 import type { Signer } from '../src/wallet/signer.js';
 
@@ -111,7 +122,13 @@ function makeBuildApi(sequence: Array<BuildResponse | Error>): BuildStub {
   return { api: api as unknown as SwapApi, buildCalls };
 }
 
-function makeLanding(options: { confirm?: Partial<LandingConfirmation> | Error } = {}) {
+function makeLanding(
+  options: {
+    confirm?: Partial<LandingConfirmation> | Error;
+    tip?: LandingTarget['tip'];
+    prepare?: LandingTarget['prepare'];
+  } = {},
+) {
   const send = vi.fn(async () => ({ signature: 'sig-router-1' }));
   const confirm = vi.fn(async (): Promise<LandingConfirmation> => {
     if (options.confirm instanceof Error) throw options.confirm;
@@ -123,7 +140,98 @@ function makeLanding(options: { confirm?: Partial<LandingConfirmation> | Error }
       ...options.confirm,
     };
   });
-  return { landing: { name: 'test', send, confirm } satisfies LandingTarget, send, confirm };
+  const landing: LandingTarget = {
+    name: 'test',
+    ...(options.tip === undefined ? {} : { tip: options.tip }),
+    ...(options.prepare === undefined ? {} : { prepare: options.prepare }),
+    send,
+    confirm,
+  };
+  return { landing, send, confirm };
+}
+
+/** Stub SwapApi bi-chemin : `/order` (meta) et `/build` (router) disponibles. */
+function makeDualApi(
+  buildSequence: Array<BuildResponse | Error>,
+  order: OrderResponse,
+): { api: SwapApi; buildCalls: BuildParams[]; orderCalls: OrderParams[] } {
+  const buildCalls: BuildParams[] = [];
+  const orderCalls: OrderParams[] = [];
+  let index = 0;
+  const api = {
+    getOrder: async (params: OrderParams) => {
+      orderCalls.push(params);
+      return order;
+    },
+    execute: () => {
+      throw new Error('execute ne doit pas être appelé en dry-run');
+    },
+    getBuild: async (params: BuildParams) => {
+      buildCalls.push(params);
+      const item = buildSequence[Math.min(index, buildSequence.length - 1)]!;
+      index += 1;
+      if (item instanceof Error) throw item;
+      return item;
+    },
+  };
+  return { api: api as unknown as SwapApi, buildCalls, orderCalls };
+}
+
+/** Commande `/order` valide (transaction v0 minimale non signée). */
+function makeOrder(overrides: Record<string, unknown> = {}): OrderResponse {
+  const message = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: '11111111111111111111111111111111',
+    instructions: [
+      SystemProgram.transfer({
+        fromPubkey: payer.publicKey,
+        toPubkey: Keypair.generate().publicKey,
+        lamports: 1,
+      }),
+    ],
+  }).compileToV0Message();
+  const transaction = Buffer.from(new VersionedTransaction(message).serialize()).toString('base64');
+  return OrderResponseSchema.parse({
+    inAmount: '100000000',
+    outAmount: '200000000',
+    router: 'metis',
+    transaction,
+    requestId: 'req-auto',
+    lastValidBlockHeight: '340123456',
+    slippageBps: 50,
+    feeBps: 10,
+    priceImpact: -0.08,
+    ...overrides,
+  });
+}
+
+/** Insère un trade live synthétique (statistiques A/B). */
+function seedTrade(db: DatabaseSync, overrides: Partial<TradeRecord> = {}): void {
+  insertTrade(db, {
+    mode: 'live',
+    status: 'success',
+    signature: null,
+    requestId: null,
+    inputMint: SOL,
+    outputMint: USDC,
+    inAmount: '100000000',
+    expectedOutAmount: null,
+    outAmount: null,
+    router: null,
+    feeBps: null,
+    feeMint: null,
+    priceImpact: null,
+    slippageBps: null,
+    realizedSlippageBps: null,
+    errorCode: null,
+    errorMessage: null,
+    createdAt: Date.now(),
+    ...overrides,
+  });
+}
+
+function autoConfig(execution: Record<string, unknown> = {}): Config {
+  return parseConfig({ execution: { path: 'auto', retry_backoff_ms: 50, ...execution } });
 }
 
 const REQUEST = { inputMint: SOL, outputMint: USDC, amountBaseUnits: 100_000_000n };
@@ -347,5 +455,155 @@ describe('Executor Router — entrées invalides', () => {
       simulate: makeSimulate(),
     });
     await expect(executor.swap(REQUEST, 'live')).rejects.toThrow(/atterrissage/);
+  });
+});
+
+describe('Executor Router — tips (Phase 6b)', () => {
+  it('honore le tip minimal imposé par la cible d’atterrissage (tx.jup : 0,001 SOL)', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuild()]);
+    const { signer } = makeSigner();
+    const { landing } = makeLanding({ tip: { minLamports: 1_000_000 } });
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig(),
+      signer,
+      simulate: makeSimulate(),
+      landing,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(buildCalls[0]?.tipAmount).toBe(1_000_000);
+    expect(buildCalls[0]?.forJitoBundle).toBeUndefined();
+    expect(outcome.router?.tipLamports).toBe(1_000_000);
+    expect(getRecentTrades(db)[0]?.tipLamports).toBe(1_000_000);
+  });
+
+  it('prépare un virement de tip Jito dédié (build taillé Jito, tip ajouté par le bot)', async () => {
+    const db = memoryDb();
+    const { api, buildCalls } = makeBuildApi([makeBuild()]);
+    const { signer } = makeSigner();
+    const tipAccount = Keypair.generate().publicKey;
+    const prepare = vi.fn(async (request: { taker: PublicKey; lamports: number }) => [
+      SystemProgram.transfer({
+        fromPubkey: request.taker,
+        toPubkey: tipAccount,
+        lamports: request.lamports,
+      }),
+    ]);
+    let simulatedTx: string | null = null;
+    const simulate: SimulateTransaction = async (transaction) => {
+      simulatedTx = transaction;
+      return { err: null, unitsConsumed: 100_000, logsTail: [] };
+    };
+    const { landing } = makeLanding({
+      tip: { minLamports: 1_000, forJitoBundle: true },
+      prepare,
+    });
+    const executor = new Executor({
+      swapApi: api,
+      config: routerConfig(),
+      signer,
+      simulate,
+      landing,
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'live');
+
+    expect(outcome.status).toBe('success');
+    expect(buildCalls[0]?.forJitoBundle).toBe(true);
+    expect(buildCalls[0]?.tipAmount).toBeUndefined();
+    expect(prepare).toHaveBeenCalledWith({ taker: payer.publicKey, lamports: 1_000 });
+    expect(outcome.router?.tipLamports).toBe(1_000);
+
+    // La transaction signée (capturée à la simulation) porte bien le virement.
+    expect(simulatedTx).not.toBeNull();
+    const transaction = VersionedTransaction.deserialize(Buffer.from(simulatedTx!, 'base64'));
+    const keys = transaction.message.staticAccountKeys;
+    const last = transaction.message.compiledInstructions.at(-1)!;
+    expect(keys[last.programIdIndex]?.equals(SystemProgram.programId)).toBe(true);
+    expect(Buffer.from(last.data).readBigUInt64LE(4)).toBe(1_000n);
+  });
+});
+
+describe('Executor — bascule automatique (path: auto)', () => {
+  it('reste sur meta_aggregator sans échantillons live', async () => {
+    const db = memoryDb();
+    const { api, buildCalls, orderCalls } = makeDualApi([makeBuild()], makeOrder());
+    const { signer } = makeSigner();
+    const executor = new Executor({
+      swapApi: api,
+      config: autoConfig(),
+      signer,
+      simulate: makeSimulate(),
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'dry_run');
+
+    expect(outcome.status).toBe('simulated');
+    expect(outcome.path).toBe('meta_aggregator');
+    expect(orderCalls).toHaveLength(1);
+    expect(buildCalls).toHaveLength(0);
+  });
+
+  it('bascule sur router quand les statistiques live le favorisent', async () => {
+    const db = memoryDb();
+    for (let i = 0; i < 25; i++) seedTrade(db, { path: 'router' });
+    for (let i = 0; i < 23; i++) seedTrade(db, { path: 'meta_aggregator' });
+    for (let i = 0; i < 2; i++) {
+      seedTrade(db, {
+        path: 'meta_aggregator',
+        status: 'failed',
+        errorCode: -1,
+        errorMessage: 'échec',
+      });
+    }
+    const { api, buildCalls, orderCalls } = makeDualApi([makeBuild()], makeOrder());
+    const { signer } = makeSigner();
+    const executor = new Executor({
+      swapApi: api,
+      config: autoConfig(),
+      signer,
+      simulate: makeSimulate(),
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'dry_run');
+
+    expect(outcome.status).toBe('simulated');
+    expect(outcome.path).toBe('router');
+    expect(buildCalls).toHaveLength(1);
+    expect(orderCalls).toHaveLength(0);
+  });
+
+  it('revient sur meta_aggregator si l’avantage du router reste dans la marge', async () => {
+    const db = memoryDb();
+    for (let i = 0; i < 24; i++) seedTrade(db, { path: 'router' });
+    seedTrade(db, {
+      path: 'router',
+      status: 'failed',
+      errorCode: -9103,
+      errorMessage: 'atterrissage',
+    });
+    for (let i = 0; i < 25; i++) seedTrade(db, { path: 'meta_aggregator' });
+    const { api, orderCalls } = makeDualApi([makeBuild()], makeOrder());
+    const { signer } = makeSigner();
+    const executor = new Executor({
+      swapApi: api,
+      config: autoConfig(),
+      signer,
+      simulate: makeSimulate(),
+      db,
+    });
+
+    const outcome = await executor.swap(REQUEST, 'dry_run');
+
+    expect(outcome.path).toBe('meta_aggregator');
+    expect(orderCalls).toHaveLength(1);
   });
 });

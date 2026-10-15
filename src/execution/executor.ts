@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { SendTransactionError, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { JupiterApiError } from '../jupiter/errors.js';
 import {
   buildSwapInstructionError,
@@ -10,11 +11,17 @@ import {
   type OrderResponse,
   type SwapApi,
 } from '../jupiter/swap.js';
-import type { LandingConfirmation, LandingTarget } from '../solana/landing.js';
+import {
+  LandingSendError,
+  type LandingConfirmation,
+  type LandingSendResult,
+  type LandingTarget,
+} from '../solana/landing.js';
 import { insertTrade, type TradeRecord } from '../state/trades.js';
 import type { Config } from '../utils/config.js';
 import { SolbotError, messageOf } from '../utils/errors.js';
 import type { Signer } from '../wallet/signer.js';
+import { collectPathStats, pickPath, type KnownPath } from './path-stats.js';
 import {
   COMPUTE_UNIT_LIMIT_MAX,
   ROUTER_CODES,
@@ -116,7 +123,10 @@ export interface ExecutorOptions {
  * Orchestre un swap selon `execution.path` :
  * - `meta_aggregator` (défaut) : `/order` → (simulation | signature) → `/execute` ;
  * - `router` (Phase 6) : `/build` → assemblage v0 → simulation (CU) → signature →
- *   atterrissage par nos soins (`LandingTarget`), confirmation on-chain.
+ *   atterrissage par nos soins (`LandingTarget`), confirmation on-chain ;
+ * - `auto` (Phase 6b) : décision par swap à partir des statistiques live
+ *   (`solbot paths`) — tant que les deux chemins n'ont pas assez
+ *   d'échantillons, le Meta-Aggregator est conservé.
  *
  * Stratégie d'échec par code `/execute` (voir `EXECUTE_ERRORS`) : `requote`
  * relance un ordre frais tant qu'il reste des tentatives, `abort` s'arrête
@@ -127,8 +137,8 @@ export class Executor {
   constructor(private readonly options: ExecutorOptions) {}
 
   async swap(request: SwapRequest, mode: SwapExecutionMode): Promise<SwapOutcome> {
-    const { config, simulate } = this.options;
-    const path = config.execution.path;
+    const { simulate } = this.options;
+    const path = this.resolvePath();
 
     if (request.inputMint === request.outputMint) {
       throw new SolbotError("Les tokens d'entrée et de sortie sont identiques");
@@ -158,6 +168,27 @@ export class Executor {
     return path === 'router'
       ? this.swapRouter(request, mode)
       : this.swapMetaAggregator(request, mode);
+  }
+
+  /**
+   * Chemin effectif du swap : valeur de configuration, ou décision `auto`
+   * fondée sur les statistiques des swaps live (même analyse que
+   * `solbot paths`). Sans base de données, l'auto retombe sur le
+   * Meta-Aggregator — prudent par défaut.
+   */
+  private resolvePath(): KnownPath {
+    const { config, db } = this.options;
+    const configured = config.execution.path;
+    if (configured !== 'auto') return configured;
+    if (db === undefined) return 'meta_aggregator';
+    const stats = collectPathStats(db, {
+      windowDays: config.execution.auto.window_days,
+      now: Date.now(),
+    });
+    return pickPath(stats, {
+      minSamples: config.execution.auto.min_samples,
+      rateMargin: config.execution.auto.rate_margin,
+    });
   }
 
   /** Chemin par défaut : `/order` → (simulation | signature) → `/execute`. */
@@ -298,6 +329,13 @@ export class Executor {
   private async swapRouter(request: SwapRequest, mode: SwapExecutionMode): Promise<SwapOutcome> {
     const { config, signer, simulate, swapApi } = this.options;
     const routerConfig = config.execution.router;
+    // Contraintes de la cible d'atterrissage (live uniquement) : tip minimal
+    // imposé par l'infra, transaction taillée Jito, instructions préparées par
+    // la cible (ex. virement de tip vers un compte Jito).
+    const landingTarget = mode === 'live' ? this.options.landing : undefined;
+    const forJitoBundle =
+      landingTarget?.tip?.forJitoBundle === true || routerConfig.for_jito_bundle;
+    const tipLamports = Math.max(routerConfig.tip_lamports, landingTarget?.tip?.minLamports ?? 0);
     const slippageBps =
       request.slippageBps ??
       (typeof config.execution.slippage === 'number' ? config.execution.slippage : undefined);
@@ -320,12 +358,10 @@ export class Executor {
           computeUnitPricePercentile: routerConfig.compute_unit_price_percentile,
           maxAccounts: routerConfig.max_accounts,
           ...(routerConfig.fast_mode ? { mode: 'fast' as const } : {}),
-          ...(routerConfig.tip_lamports > 0
-            ? {
-                tipAmount: routerConfig.tip_lamports,
-                forJitoBundle: routerConfig.for_jito_bundle,
-              }
-            : {}),
+          ...(forJitoBundle ? { forJitoBundle: true } : {}),
+          // Pour Jito, le tip est un virement vers un compte Jito ajouté par
+          // l'assembleur (`prepare`) : on ne demande pas de tip Jupiter.
+          ...(tipLamports > 0 && !forJitoBundle ? { tipAmount: tipLamports } : {}),
         });
       } catch (error) {
         // Rien à exécuter : pas de ligne `trades` ; HTTP 400 = pas de route, définitif.
@@ -379,11 +415,18 @@ export class Executor {
 
       await this.options.onQuote?.(order, attempt);
 
-      // 2) Simulation sonde (limite maximale) : mesure les CU réellement consommés.
+      // 2) Instructions préparées par la cible d'atterrissage (ex. virement de
+      // tip Jito), puis simulation sonde (limite maximale) : la sonde mesure
+      // ainsi les CU de la transaction réellement envoyée.
+      const extraInstructions =
+        landingTarget?.prepare !== undefined && tipLamports > 0
+          ? await landingTarget.prepare({ taker: signer.publicKey, lamports: tipLamports })
+          : [];
       const probe = buildRouterTransaction({
         build,
         payerKey: signer.publicKey,
         cuLimit: COMPUTE_UNIT_LIMIT_MAX,
+        additionalInstructions: extraInstructions,
       });
       const simulation = await simulate!(serializeTransaction(probe.transaction));
       const simulationError = simulation.err === null ? null : messageOf(simulation.err);
@@ -430,6 +473,7 @@ export class Executor {
         build,
         payerKey: signer.publicKey,
         cuLimit,
+        additionalInstructions: extraInstructions,
         ...(routerConfig.cu_price_cap_microlamports > 0
           ? { cuPriceCapMicrolamports: routerConfig.cu_price_cap_microlamports }
           : {}),
@@ -437,7 +481,7 @@ export class Executor {
       const details: RouterExecutionDetails = {
         cuLimit,
         cuPriceMicrolamports: finalTransaction.cuPriceMicrolamports,
-        tipLamports: routerConfig.tip_lamports > 0 ? routerConfig.tip_lamports : null,
+        tipLamports: tipLamports > 0 ? tipLamports : null,
         landing: null,
         landingMs: null,
       };
@@ -464,22 +508,28 @@ export class Executor {
       // 4) Signature puis atterrissage par nos soins.
       const landing = this.options.landing!;
       signer.signTransaction(finalTransaction.transaction);
+      const [signatureBytes] = finalTransaction.transaction.signatures;
+      if (signatureBytes === undefined) {
+        throw new SolbotError('signature locale manquante après signature de la transaction');
+      }
       const signedTransaction = serializeTransaction(finalTransaction.transaction);
       const landingContext = {
         blockhash: finalTransaction.blockhash,
         lastValidBlockHeight: finalTransaction.lastValidBlockHeight,
         outputMint: request.outputMint,
         taker: signer.address,
+        signature: bs58.encode(signatureBytes),
       };
 
       const startedAt = Date.now();
-      let signature: string;
+      let sendResult: LandingSendResult;
       try {
-        ({ signature } = await landing.send(signedTransaction, landingContext));
+        sendResult = await landing.send(signedTransaction, landingContext);
       } catch (error) {
-        // Preflight refusé = jamais soumise → re-cotation sûre. Autre erreur =
-        // sort inconnu : on n'enchaîne pas un second envoi à l'aveugle.
-        const preflight = error instanceof SendTransactionError;
+        // Envoi refusé (preflight RPC ou cible d'atterrissage) = jamais soumise
+        // → re-cotation sûre. Autre erreur (5xx, timeout) = sort inconnu : on
+        // n'enchaîne pas un second envoi à l'aveugle.
+        const rejected = error instanceof SendTransactionError || error instanceof LandingSendError;
         const label = `envoi refusé : ${messageOf(error)}`;
         lastFailure = { kind: 'execute', label, code: ROUTER_CODES.send };
         attempts.push({
@@ -489,7 +539,7 @@ export class Executor {
           label,
           signature: null,
         });
-        if (preflight && attempt < maxAttempts) continue;
+        if (rejected && attempt < maxAttempts) continue;
         const tradeId = this.record(order, request, mode, {
           status: 'failed',
           errorCode: ROUTER_CODES.send,
@@ -513,9 +563,11 @@ export class Executor {
         );
       }
 
+      const signature = sendResult.signature;
+
       let confirmation: LandingConfirmation;
       try {
-        confirmation = await landing.confirm(signature, landingContext);
+        confirmation = await landing.confirm(signature, landingContext, sendResult);
       } catch (error) {
         // Timeout/expiration : la transaction peut encore atterrir — jamais de réessai ici.
         const landingMs = Date.now() - startedAt;

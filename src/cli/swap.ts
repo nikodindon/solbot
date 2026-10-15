@@ -8,7 +8,7 @@ import { JupiterClient } from '../jupiter/client.js';
 import { SwapApi, routerLabel, type OrderResponse } from '../jupiter/swap.js';
 import { TokensApi } from '../jupiter/tokens.js';
 import { resolveConnection } from '../solana/connection.js';
-import { RpcLanding } from '../solana/landing.js';
+import { createLandingTarget } from '../solana/landing.js';
 import { buildSimulator } from '../solana/simulate.js';
 import { fetchTokenBalances } from '../solana/tokens.js';
 import { openDatabase, resolveDatabasePath } from '../state/db.js';
@@ -35,8 +35,10 @@ export interface SwapCliOptions {
   yes?: boolean;
   maxSlippageBps?: string;
   root?: string;
-  /** Surcharge ponctuelle du chemin d'exécution (`meta_aggregator` | `router`). */
+  /** Surcharge ponctuelle du chemin d'exécution (`meta_aggregator` | `router` | `auto`). */
   path?: string;
+  /** Surcharge ponctuelle de la cible d'atterrissage (`rpc` | `tx_jup` | `jito`). */
+  landing?: string;
 }
 
 interface SwapAsset extends ResolvedAsset {
@@ -63,7 +65,10 @@ export async function runSwap(
 
   const mode = resolveMode(options, config);
   const slippageBps = resolveSlippageBps(options, config);
-  const effectiveConfig = applyPathOverride(config, options.path);
+  const effectiveConfig = applyLandingOverride(
+    applyPathOverride(config, options.path),
+    options.landing,
+  );
 
   const signer = EnvSigner.fromEnv(env);
   const client = new JupiterClient({ apiKey: env.JUPITER_API_KEY, ratePerSecond: env.JUPITER_RPS });
@@ -89,10 +94,11 @@ export async function runSwap(
   runMigrations(db);
 
   try {
-    const routerPath = effectiveConfig.execution.path === 'router';
-    // Le chemin Router simule aussi en live (estimation des compute units).
+    // Le chemin Router simule aussi en live (estimation des compute units) ;
+    // `auto` peut basculer sur le Router, on prépare donc les deux chemins.
+    const pathMayBeRouter = effectiveConfig.execution.path !== 'meta_aggregator';
     const simulate =
-      mode !== 'live' || routerPath ? buildSimulator((await connect()).connection) : undefined;
+      mode !== 'live' || pathMayBeRouter ? buildSimulator((await connect()).connection) : undefined;
 
     if (mode === 'live') {
       await confirmLivePlannedSwap({
@@ -111,8 +117,14 @@ export async function runSwap(
       config: effectiveConfig,
       signer,
       ...(simulate === undefined ? {} : { simulate }),
-      ...(mode === 'live' && routerPath
-        ? { landing: new RpcLanding((await connect()).connection) }
+      ...(mode === 'live' && pathMayBeRouter
+        ? {
+            landing: createLandingTarget({
+              choice: effectiveConfig.execution.router.landing,
+              connection: (await connect()).connection,
+              apiKey: env.JUPITER_API_KEY,
+            }),
+          }
         : {}),
       db,
       onQuote: mode === 'live' ? printLiveQuote : undefined,
@@ -166,14 +178,34 @@ function resolveSlippageBps(options: SwapCliOptions, config: Config): number | u
   return bps;
 }
 
-/** `--path` : surcharge ponctuelle du chemin d'exécution (comparaison meta-aggregator vs router). */
+/**
+ * `--path` : surcharge ponctuelle du chemin d'exécution (comparaison
+ * meta-aggregator vs router, ou bascule automatique `auto`).
+ */
 function applyPathOverride(config: Config, path: string | undefined): Config {
   if (path === undefined) return config;
-  if (path === 'meta_aggregator' || path === 'router') {
+  if (path === 'meta_aggregator' || path === 'router' || path === 'auto') {
     return { ...config, execution: { ...config.execution, path } };
   }
   throw new SolbotError(`Chemin d'exécution inconnu « ${path} »`, {
-    hint: 'Valeurs acceptées : meta_aggregator, router.',
+    hint: 'Valeurs acceptées : meta_aggregator, router, auto.',
+  });
+}
+
+/** `--landing` : surcharge ponctuelle de la cible d'atterrissage (chemin router). */
+function applyLandingOverride(config: Config, landing: string | undefined): Config {
+  if (landing === undefined) return config;
+  if (landing === 'rpc' || landing === 'tx_jup' || landing === 'jito') {
+    return {
+      ...config,
+      execution: {
+        ...config.execution,
+        router: { ...config.execution.router, landing },
+      },
+    };
+  }
+  throw new SolbotError(`Cible d'atterrissage inconnue « ${landing} »`, {
+    hint: 'Valeurs acceptées : rpc, tx_jup, jito.',
   });
 }
 
@@ -440,7 +472,11 @@ export function swapCommand(): Command {
     .option('--max-slippage-bps <n>', 'slippage max en bps (plafonné par risk.max_slippage_bps)')
     .option(
       '--path <chemin>',
-      'chemin d’exécution : meta_aggregator ou router (défaut : config.yaml)',
+      'chemin d’exécution : meta_aggregator, router ou auto (défaut : config.yaml)',
+    )
+    .option(
+      '--landing <cible>',
+      'cible d’atterrissage (chemin router) : rpc, tx_jup ou jito (défaut : config.yaml)',
     )
     .action(
       async (
@@ -453,6 +489,7 @@ export function swapCommand(): Command {
           yes?: boolean;
           maxSlippageBps?: string;
           path?: string;
+          landing?: string;
         },
       ) => {
         try {
@@ -464,6 +501,7 @@ export function swapCommand(): Command {
               ? {}
               : { maxSlippageBps: options.maxSlippageBps }),
             ...(options.path === undefined ? {} : { path: options.path }),
+            ...(options.landing === undefined ? {} : { landing: options.landing }),
           });
           process.exitCode = swapExitCode(outcome);
         } catch (error) {

@@ -8,6 +8,7 @@ import { backupCommand } from './cli/backup.js';
 import { balanceCommand } from './cli/balance.js';
 import { doctorCommand } from './cli/doctor.js';
 import { initCommand } from './cli/init.js';
+import { pathsCommand } from './cli/paths.js';
 import { priceCommand } from './cli/price.js';
 import { reportCommand } from './cli/report.js';
 import { scanCommand } from './cli/scan.js';
@@ -49,6 +50,9 @@ program.addCommand(reportCommand());
 
 // Phase 5 : sauvegardes SQLite (production 24/7)
 program.addCommand(backupCommand());
+
+// Phase 6 : comparaison A/B des chemins d'exécution (router vs meta-aggregator)
+program.addCommand(pathsCommand());
 
 program.showHelpAfterError('(lancez `solbot --help` pour la liste des commandes)');
 

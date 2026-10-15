@@ -16,7 +16,7 @@ import { TokensApi } from '../jupiter/tokens.js';
 import { pollOnce } from '../market/poller.js';
 import { Supervisor } from '../monitoring/supervisor.js';
 import { resolveConnection } from '../solana/connection.js';
-import { RpcLanding } from '../solana/landing.js';
+import { createLandingTarget } from '../solana/landing.js';
 import { buildSimulator } from '../solana/simulate.js';
 import { fetchTokenBalances } from '../solana/tokens.js';
 import { openDatabase, resolveDatabasePath } from '../state/db.js';
@@ -194,7 +194,9 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
     }
 
     // ── Exécuteur (requis en dry-run/live) ─────────────────────────────────
-    const routerPath = config.execution.path === 'router';
+    // `auto` peut basculer sur le Router : on prépare simulation et
+    // atterrissage comme pour le chemin Router explicite.
+    const pathMayBeRouter = config.execution.path !== 'meta_aggregator';
     const executor =
       mode === 'paper'
         ? undefined
@@ -204,11 +206,17 @@ export async function runStart(options: StartCliOptions = {}): Promise<void> {
             signer,
             db,
             // Le chemin Router simule dans tous les modes (estimation des compute units).
-            ...(mode === 'dry_run' || routerPath
+            ...(mode === 'dry_run' || pathMayBeRouter
               ? { simulate: buildSimulator((await connection()).connection) }
               : {}),
-            ...(mode === 'live' && routerPath
-              ? { landing: new RpcLanding((await connection()).connection) }
+            ...(mode === 'live' && pathMayBeRouter
+              ? {
+                  landing: createLandingTarget({
+                    choice: config.execution.router.landing,
+                    connection: (await connection()).connection,
+                    apiKey: env.JUPITER_API_KEY,
+                  }),
+                }
               : {}),
             onQuote: (order) => {
               console.log(

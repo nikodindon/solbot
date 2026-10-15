@@ -128,11 +128,17 @@ export interface BuildRouterTransactionArgs {
   cuLimit: number;
   /** Plafond du prix des CU en micro-lamports (undefined/0 = pas de plafond). */
   cuPriceCapMicrolamports?: number | undefined;
+  /**
+   * Instructions ajoutées en fin de transaction après le tip du build
+   * (ex. virement de tip Jito préparé par la cible d'atterrissage).
+   */
+  additionalInstructions?: readonly TransactionInstruction[] | undefined;
 }
 
 /**
  * Assemble la transaction v0 du chemin Router :
- * `setComputeUnitLimit` + budget (plafonné) + setup + swap + cleanup + other + tip.
+ * `setComputeUnitLimit` + budget (plafonné) + setup + swap + cleanup + other + tip
+ * + instructions supplémentaires (le cas échéant).
  */
 export function buildRouterTransaction(args: BuildRouterTransactionArgs): RouterTransaction {
   const { build, payerKey, cuLimit } = args;
@@ -172,6 +178,7 @@ export function buildRouterTransaction(args: BuildRouterTransactionArgs): Router
     ...(build.tipInstruction === null || build.tipInstruction === undefined
       ? []
       : [apiInstructionToWeb3(build.tipInstruction)]),
+    ...(args.additionalInstructions ?? []),
   ];
 
   const blockhash = bs58.encode(Uint8Array.from(metadata.blockhash));

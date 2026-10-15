@@ -94,20 +94,25 @@ backtest: # backtest offline (`solbot backtest`) — rejoue le moteur réel sur 
     require_positive_net_pnl: false # true = exiger aussi un PnL net positif
 
 execution:
-  path: meta_aggregator # meta_aggregator (/order+/execute) | router (/build — Phase 6)
+  path: meta_aggregator # meta_aggregator (/order+/execute) | router (/build) | auto (bascule sur les stats live — 6b)
   slippage: rtse # rtse (recommandé) | <entier en bps>
   exclude_routers: [] # ex. [jupiterz] pour forcer des frais de gaz classiques
   retries: 3
   retry_backoff_ms: 750
   confirm_timeout_s: 60
-  router: # chemin router uniquement (path: router) — Phase 6
+  router: # chemins router/auto uniquement — Phase 6
     compute_unit_price_percentile: high # medium | high | veryHigh | <bps 0-10000>
     max_accounts: 64 # plafond de comptes de la route (1-64)
     fast_mode: false # true = latence réduite, routage légèrement moins optimal
     cu_limit_buffer: 1.2 # limite CU = buffer × CU simulés (1-2)
     cu_price_cap_microlamports: 0 # plafond du prix des CU (0 = pas de plafond)
-    tip_lamports: 0 # tip inclus par /build (1 000 000 = 0,001 SOL) — inutile en landing RPC
-    for_jito_bundle: false # tail le tip pour un bundle Jito (atterrissage Jito — 6b)
+    landing: rpc # rpc (votre nœud) | tx_jup (infra Jupiter, tip ≥ 0,001 SOL) | jito (bundles)
+    tip_lamports: 0 # tip minimal (le landing tx_jup impose 1 000 000 = 0,001 SOL ; jito : conseillé ≥ 1 000 000)
+    for_jito_bundle: false # imposé automatiquement par landing: jito
+  auto: # bascule automatique (path: auto) — Phase 6b
+    window_days: 7 # fenêtre glissante des statistiques live
+    min_samples: 20 # swaps live minimum par chemin avant de comparer
+    rate_margin: 0.02 # écart de taux de landing exigé pour basculer (2 points)
 
 notifications:
   telegram:
