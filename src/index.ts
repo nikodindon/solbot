@@ -14,8 +14,10 @@ import { reportCommand } from './cli/report.js';
 import { scanCommand } from './cli/scan.js';
 import { startCommand } from './cli/start.js';
 import { swapCommand } from './cli/swap.js';
+import { telegramSetupCommand } from './cli/telegram.js';
 import { versionCommand } from './cli/version.js';
 import { watchCommand } from './cli/watch.js';
+import { webCommand } from './cli/web.js';
 import { getPackageVersion } from './utils/package.js';
 
 const program = new Command();
@@ -53,6 +55,10 @@ program.addCommand(backupCommand());
 
 // Phase 6 : comparaison A/B des chemins d'exécution (router vs meta-aggregator)
 program.addCommand(pathsCommand());
+
+// Phase 7 : tableau de bord web temps réel + assistant de configuration Telegram
+program.addCommand(webCommand());
+program.addCommand(telegramSetupCommand());
 
 program.showHelpAfterError('(lancez `solbot --help` pour la liste des commandes)');
 

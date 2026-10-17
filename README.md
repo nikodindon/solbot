@@ -239,6 +239,7 @@ npm run solbot -- backtest --days 30 --label base  # rejoue le moteur réel (Pha
 npm run solbot -- report --days 30                 # métriques + comparaison au dernier backtest
 npm run solbot -- swap SOL USDC 0.05 --dry-run   # swap simulé : vrai /order + simulation RPC, sans signature
 npm run solbot -- start --paper   # démarre le moteur en mode paper (Phase 3)
+npm run solbot -- web             # tableau de bord temps réel sur http://0.0.0.0:4100 (dans un autre terminal)
 ```
 
 Le mode **paper** est le défaut à l'installation :
@@ -441,6 +442,11 @@ monitoring:                  # serveur HTTP local : /healthz (Docker/systemd) + 
   enabled: false
   host: 127.0.0.1
   port: 9464
+
+dashboard:                   # tableau de bord web temps réel (`solbot web`) — lecture seule
+  host: 0.0.0.0              # 0.0.0.0 = accessible depuis votre réseau local (aucune authentification)
+  port: 4100
+  recent_limit: 25           # éléments récents affichés par liste
 
 alerts:                      # alerting (publié via notifications.telegram)
   enabled: true
@@ -727,6 +733,17 @@ Le healthcheck Docker s'appuie sur `/healthz` (503 → conteneur `unhealthy`) ; 
 
 ### 12.3 Telegram : notifications & commandes
 
+Configuration en une commande : créez un bot avec **@BotFather** (`/newbot`), envoyez-lui `/start`
+depuis votre compte, puis :
+
+```bash
+npm run solbot -- telegram-setup --token <token-du-bot>
+```
+
+L'assistant valide le token (`getMe`), découvre le `chat_id` (`getUpdates`), écrit
+`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` dans `.env`, puis envoie un message de test. Il ne reste
+qu'à passer `notifications.telegram.enabled: true` dans `config.yaml` et relancer le bot.
+
 `notifications.telegram.enabled: true` + `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` dans `.env` :
 
 - **Notifications sortantes** (`notify_on`) : `trade` (chaque achat/vente), `error` (erreur de tick),
@@ -772,6 +789,28 @@ Règles évaluées à chaque tick, anti-spam par règle (`alerts.cooldown_min`, 
   si vous redirigez les logs vers des fichiers.
 - **Reprise** : un redémarrage (crash, mise à jour, reboot) rejoue la réconciliation depuis la chaîne puis reprend
   l'état SQLite — aucune intervention manuelle.
+
+### 12.7 Tableau de bord web — `solbot web`
+
+Page temps réel qui reflète **tout ce que fait le bot pendant qu'il tourne**, exposée par défaut sur
+`http://0.0.0.0:4100` (`dashboard.host` / `dashboard.port` / `dashboard.recent_limit` dans `config.yaml`) :
+
+```bash
+npm run solbot -- web                        # http://0.0.0.0:4100
+npm run solbot -- web --port 4101 --host 127.0.0.1   # surcharges ponctuelles
+```
+
+Le serveur ouvre SQLite en **lecture seule** : il peut tourner en parallèle du moteur (aucun impact sur
+le run, aucun redémarrage nécessaire). Endpoints :
+
+| Endpoint | Contenu |
+|---|---|
+| `GET /` | page HTML autonome (aucune ressource externe), actualisée toutes les 3 s. Cartes (NAV, caisse, P&L, drawdown, jour, réserve), courbe de NAV, positions ouvertes, watchlist (prêts `x/y`), trades récents, signaux, rejets de risque, journal d'événements, bandeau pauses/kill-switch |
+| `GET /api/overview` | même contenu en JSON (`/api/overview`) — prêt pour un client ou un widget externe |
+| `GET /healthz` | `{"status":"ok"}` (200) si le dernier tick a moins de 120 s, sinon `stale` (503) |
+
+⚠ **Aucune authentification** : à réserver au réseau local (le port expose des données de trading, pas
+de secrets). Ne l'exposez pas sur Internet tel quel.
 
 ---
 

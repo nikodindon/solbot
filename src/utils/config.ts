@@ -266,6 +266,14 @@ const MonitoringSchema = z.strictObject({
   port: z.number().int().min(1).max(65535).default(9464),
 });
 
+const DashboardSchema = z.strictObject({
+  /** Tableau de bord web (`solbot web`) : page + `/api/overview`. Lecture seule. */
+  host: z.string().min(1).default('0.0.0.0'),
+  port: z.number().int().min(1).max(65535).default(4100),
+  /** Nombre d'éléments récents affichés par liste. */
+  recent_limit: z.number().int().min(5).max(500).default(25),
+});
+
 const AlertsSchema = z.strictObject({
   enabled: z.boolean().default(true),
   /** Anti-spam : délai minimal entre deux alertes d'une même règle (minutes). */
@@ -307,6 +315,7 @@ export const ConfigSchema = z.strictObject({
   backtest: BacktestSchema.default(BacktestSchema.parse({})),
   notifications: NotificationsSchema.default(NotificationsSchema.parse({})),
   monitoring: MonitoringSchema.default(MonitoringSchema.parse({})),
+  dashboard: DashboardSchema.default(DashboardSchema.parse({})),
   alerts: AlertsSchema.default(AlertsSchema.parse({})),
   backups: BackupsSchema.default(BackupsSchema.parse({})),
   database: DatabaseSchema.default(DatabaseSchema.parse({})),

@@ -143,6 +143,11 @@ monitoring: # serveur HTTP local : /healthz (Docker/systemd) + /metrics (Prometh
   host: 127.0.0.1
   port: 9464
 
+dashboard: # tableau de bord web temps réel (`solbot web`) — lecture seule
+  host: 0.0.0.0 # 0.0.0.0 = accessible depuis votre réseau local (aucune authentification)
+  port: 4100
+  recent_limit: 25 # éléments récents affichés par liste
+
 alerts: # alerting (publie via notifications.telegram.enabled)
   enabled: true
   cooldown_min: 30 # anti-spam : délai minimal entre deux alertes d'une même règle
