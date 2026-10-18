@@ -787,6 +787,13 @@ Règles évaluées à chaque tick, anti-spam par règle (`alerts.cooldown_min`, 
   `restart: unless-stopped`, healthcheck natif, logs bornés (5 × 10 Mo).
 - **systemd** (alternative) : `deploy/solbot.service` (redémarrage auto, logs journald) + `deploy/logrotate.solbot`
   si vous redirigez les logs vers des fichiers.
+- **Mode paper continu (watchdog)** : `deploy/watchdog-paper.sh` enchaîne un `scan` (watchlist reconstruite),
+  puis `start --paper --duration 43200` (12 h) ; si le moteur s'arrête (crash, coupure réseau), il le relance
+  après 30 s. L'état SQLite (caisse, positions) est conservé d'un cycle à l'autre. Lancement :
+  `tmux new-session -d -s solbot-continuous 'bash deploy/watchdog-paper.sh'`.
+  Journaux : `data/paper-continuous.log` (moteur + scans) et `data/watchdog.log` (cycles, relances).
+  Arrêt : `tmux kill-session -t solbot-continuous`. Le kill-switch `STOP` (`/kill`) coupe les entrées mais
+  ne stoppe pas le processus — les sorties restent gérées.
 - **Reprise** : un redémarrage (crash, mise à jour, reboot) rejoue la réconciliation depuis la chaîne puis reprend
   l'état SQLite — aucune intervention manuelle.
 
