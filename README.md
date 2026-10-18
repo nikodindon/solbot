@@ -272,6 +272,78 @@ npm run solbot -- swap USDC SOL 10 --live             # ⚠ fonds réels — con
 npm run solbot -- swap SOL USDC 0.01 --live --yes     # ⚠ automatisation — pas de confirmation (bots/cron)
 ```
 
+### 5.6 Guide d'utilisation au quotidien
+
+Une fois installé, voici l'essentiel — **aucune connaissance technique nécessaire**. Toutes les
+commandes se lancent depuis le dossier du projet (`cd ~/projects/solbot`).
+
+#### Démarrer (mode paper continu, recommandé)
+
+```bash
+# moteur : scan de la watchlist toutes les 12 h + relance auto en cas d'arrêt
+tmux new-session -d -s solbot-continuous 'bash deploy/watchdog-paper.sh'
+
+# tableau de bord (à laisser tourner aussi)
+tmux new-session -d -s solbot-web 'npm run solbot -- web'
+```
+
+Le dashboard est alors sur **http://127.0.0.1:4100** (ou `http://<ip-du-pc>:4100` depuis le réseau local).
+Le détail du fonctionnement du watchdog est en [§12.6](#126-déploiement-247).
+
+#### Vérifier en 10 secondes que tout va bien
+
+```bash
+tmux ls                                    # solbot-continuous et solbot-web doivent apparaître
+curl -s http://127.0.0.1:4100/healthz      # {"status":"ok"} ; "stale" (503) = moteur arrêté
+tail -n 3 data/paper-continuous.log        # dernier tick (heures en UTC)
+tail -n 5 data/watchdog.log                # cycles et relances
+```
+
+#### Suivre le bot
+
+| Quoi | Où |
+|---|---|
+| **Vue temps réel** | dashboard http://127.0.0.1:4100 (rafraîchi toutes les 3 s) |
+| **Chaque trade** | notification **Telegram** (si activé, voir [§12.3](#123-telegram--notifications--commandes)) |
+| **Journal moteur** | `tail -f data/paper-continuous.log` |
+| **Journal watchdog** | `tail -f data/watchdog.log` |
+| **Direct dans tmux** | `tmux attach -t solbot-continuous` (quitter : `Ctrl+B` puis `D`) |
+
+Commandes Telegram : `/status`, `/positions`, `/pnl [jours]`, `/pause`, `/resume`, `/kill`, `/help`.
+
+#### Faire un bilan
+
+```bash
+npm run solbot -- report --days 7       # PnL, win rate, drawdown, frais (7 derniers jours)
+npm run solbot -- report --days 30 --telegram   # et publication sur Telegram
+```
+
+#### Arrêter / relancer
+
+```bash
+tmux kill-session -t solbot-continuous    # arrêt complet (moteur inclus)
+tmux kill-session -t solbot-web           # arrêt du dashboard
+# relancer = rejouer les deux commandes « Démarrer » ci-dessus (l'état est conservé)
+```
+
+> ⚠️ Le kill-switch `/kill` (fichier `STOP`) coupe les **entrées** mais laisse le moteur gérer les
+> **sorties** (stops, trailing). Pour tout arrêter, utiliser `tmux kill-session` ci-dessus.
+
+#### Mémo « je veux… »
+
+| Je veux… | Commande |
+|---|---|
+| démarrer le bot en continu | `tmux new-session -d -s solbot-continuous 'bash deploy/watchdog-paper.sh'` |
+| démarrer le dashboard | `tmux new-session -d -s solbot-web 'npm run solbot -- web'` |
+| voir si ça tourne | `tmux ls` + `curl -s http://127.0.0.1:4100/healthz` |
+| voir le bot en direct | `tmux attach -t solbot-continuous` |
+| suivre les logs | `tail -f data/paper-continuous.log` |
+| faire un bilan | `npm run solbot -- report --days 7` |
+| sauvegarder la base | `npm run solbot -- backup` |
+| rafraîchir la watchlist | `npm run solbot -- scan` (appliqué au prochain redémarrage) |
+| faire un run chronométré | `npm run solbot -- start --paper --duration 3600` |
+| tout arrêter | `tmux kill-session -t solbot-continuous` |
+
 ---
 
 ## 6. Le wallet & le fichier `.env`
