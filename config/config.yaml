@@ -17,7 +17,8 @@ universe: # quels actifs le scanner peut trader
   min_liquidity_usd: 250000
   min_organic_score: 60 # score "organic" Jupiter : filtre anti-volume artificiel
   min_age_hours: 24 # évite les tokens < 24 h (frais Jupiter 50 bps + risque rug)
-  blacklist_mints: [] # mints interdits (ex. tokens à problème connus)
+  blacklist_mints: # mints interdits (ex. tokens à problème connus)
+    - Xs3oZwbHvqis4NYcf4YKWmEia2eC84wSiVrcYcTqpH8 # SPCXx (SpaceX xStock) — doublon du sous-jacent SPCX (Backpack)
   whitelist_mints: [] # si non vide → univers restreint à cette liste
   max_watchlist: 40 # taille max de la short-list surveillée
 
@@ -57,8 +58,8 @@ strategies: # chaque stratégie est activable/paramétrable indépendamment
     params: { wallets: [], max_delay_ms: 2000, size_mode: proportional, max_trade_usdc: 50 }
 
 risk: # le RiskManager a toujours le dernier mot
-  max_position_pct: 5 # % du NAV par position
-  max_positions: 6 # nombre max de positions ouvertes simultanément
+  max_position_pct: 6.5 # % du NAV par position (+30 % vs 5 % : marché en réveil)
+  max_positions: 14 # nombre max de positions ouvertes simultanément (14 × 6,5 % ≈ 91 % du NAV, ~9 % de réserve)
   max_asset_exposure_pct: 15 # % du NAV max sur un même actif
   daily_loss_limit_pct: 3 # perte journalière max → pause automatique 24 h
   max_drawdown_pct: 15 # drawdown max depuis le pic → kill-switch
@@ -103,7 +104,7 @@ execution:
 
 notifications:
   telegram:
-    enabled: false # true + TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID renseignés dans .env
+    enabled: true # true + TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID renseignés dans .env
     notify_on: [trade, error, daily_report] # ajoutez alert, backup si souhaité
     commands_enabled: true # commandes entrantes : /status /positions /pnl /pause /resume /kill
     daily_report_utc_hour: 8 # heure UTC du rapport PnL quotidien (moteur en marche)
