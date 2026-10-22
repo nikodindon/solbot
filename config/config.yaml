@@ -67,7 +67,7 @@ risk: # le RiskManager a toujours le dernier mot
   take_profit_pct: 15
   trailing_stop: { activation_pct: 6, retrace_pct: 3 }
   max_slippage_bps: 100 # utilisé si execution.slippage n'est pas 'rtse'
-  min_time_between_trades_s: 300
+  min_time_between_trades_s: 1800 # 30 min anti-churn : évite de racheter juste après un stop/TP
   max_price_impact_pct: 1.0 # rejet si l'impact estimé dépasse ce seuil
   sol_gas_reserve: 0.05 # SOL intouchable, réservé aux frais
 
