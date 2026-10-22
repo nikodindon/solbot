@@ -444,11 +444,17 @@ risk:                      # le RiskManager a toujours le dernier mot
   max_drawdown_pct: 15         # drawdown max depuis le pic → kill-switch
   stop_loss_pct: 8
   take_profit_pct: 15
+  partial_take_profit: { enabled: false, pct: 6, fraction: 0.5 } # TP partiel
   trailing_stop: { activation_pct: 6, retrace_pct: 3 }
   max_slippage_bps: 100        # utilisé si execution.slippage n'est pas 'rtse'
   min_time_between_trades_s: 300
   max_price_impact_pct: 1.0    # rejet si l'impact estimé dépasse ce seuil
   sol_gas_reserve: 0.05        # SOL intouchable, réservé aux frais
+
+> **TP partiel** : si `partial_take_profit.enabled` est `true`, le moteur vend
+> `fraction` de la position dès que le prix atteint `entrée × (1 + pct/100)`
+> (ex. 50 % à +6 %), puis laisse le reste courir avec le trailing et le TP plein.
+> Le drapeau `partial_tp_taken` garantit qu'il ne se rejoue pas. Désactivé par défaut.
 
 paper:                     # portefeuille virtuel (modes paper et dry-run)
   initial_usdc: 1000           # caisse virtuelle de départ (USD)

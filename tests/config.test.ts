@@ -58,6 +58,7 @@ describe('parseConfig', () => {
     expect(config.loop_interval_s).toBe(30);
     expect(config.risk.max_positions).toBe(6);
     expect(config.risk.trailing_stop.retrace_pct).toBe(3);
+    expect(config.risk.partial_take_profit).toEqual({ enabled: false, pct: 6, fraction: 0.5 });
     expect(config.execution.path).toBe('meta_aggregator');
     expect(config.execution.slippage).toBe('rtse');
     expect(config.strategies.momentum.enabled).toBe(true);
@@ -78,6 +79,16 @@ describe('parseConfig', () => {
     expect(config.universe.interval).toBe('24h');
     expect(config.universe.candidate_limit).toBe(100);
     expect(config.universe.max_watchlist).toBe(40);
+  });
+
+  it('configure le TP partiel et rejette une fraction hors bornes', () => {
+    const config = parseConfig({
+      risk: { partial_take_profit: { enabled: true, pct: 8, fraction: 0.33 } },
+    });
+    expect(config.risk.partial_take_profit).toEqual({ enabled: true, pct: 8, fraction: 0.33 });
+    expect(() =>
+      parseConfig({ risk: { partial_take_profit: { enabled: true, fraction: 1 } } }),
+    ).toThrowError(/fraction/);
   });
 
   it('rejette une clé inconnue (typo dans une section)', () => {

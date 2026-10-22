@@ -22,6 +22,7 @@ import {
   openPosition,
   reducePositionFifo,
   updatePositionMarks,
+  markPartialTakeProfit,
   qtyToFloat,
   type PositionRow,
 } from '../state/positions.js';
@@ -469,7 +470,12 @@ export class Engine {
         info?.liquidityUsd ?? null,
         solPriceUsd,
       );
-      if (line !== null) exits.push(line);
+      if (line !== null) {
+        if (plan.partialTakeProfit === true) {
+          markPartialTakeProfit(db, position.id, this.now());
+        }
+        exits.push(line);
+      }
     }
 
     // ── 6. Entrées : arbitrage puis contrôles de risque ────────────────────
@@ -753,7 +759,14 @@ export class Engine {
     price: number,
     arbitrated: ProducedSignal | undefined,
     ts: number,
-  ): { trigger: string; strategy: string; signalId?: number; qtyBaseUnits: string } | null {
+  ): {
+    trigger: string;
+    strategy: string;
+    signalId?: number;
+    qtyBaseUnits: string;
+    /** true → marquer le TP partiel comme exécuté après la vente. */
+    partialTakeProfit?: boolean;
+  } | null {
     const { db, config } = this.deps;
     const entry = position.avgEntryPriceUsd;
     const peakBefore = position.peakPriceUsd ?? entry;
@@ -783,6 +796,18 @@ export class Engine {
     }
     if (position.takeProfitPriceUsd !== null && price >= position.takeProfitPriceUsd) {
       return { trigger: 'take_profit', strategy: 'risk', qtyBaseUnits: position.qtyRemaining };
+    }
+    const partial = config.risk.partial_take_profit;
+    if (partial.enabled && !position.partialTpTaken) {
+      const partialLevel = entry * (1 + partial.pct / 100);
+      if (price >= partialLevel) {
+        return {
+          trigger: 'partial_take_profit',
+          strategy: 'risk',
+          qtyBaseUnits: sellQuantity(position, partial.fraction),
+          partialTakeProfit: true,
+        };
+      }
     }
     if (arbitrated !== undefined) {
       return {
@@ -1073,6 +1098,7 @@ const TRIGGER_LABELS: Record<string, string> = {
   entry: 'entrée',
   stop_loss: 'stop-loss',
   take_profit: 'take-profit',
+  partial_take_profit: 'prise de profit partielle',
   trailing_stop: 'trailing stop',
   momentum_exit: 'sortie momentum',
   mean_reversion_exit: 'sortie mean-reversion',

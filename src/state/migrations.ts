@@ -270,6 +270,14 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE trades ADD COLUMN landing_ms INTEGER;
     `,
   },
+  {
+    version: 6,
+    name: 'partial_take_profit',
+    sql: `
+      -- TP partiel : 1 = la fraction a déjà été sécurisée ; le reste continue.
+      ALTER TABLE positions ADD COLUMN partial_tp_taken INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 /** Applique les migrations manquantes. Retourne le nombre de migrations appliquées. */

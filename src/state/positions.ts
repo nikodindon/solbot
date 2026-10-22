@@ -21,6 +21,8 @@ export interface PositionRow {
   peakPriceUsd: number | null;
   stopLossPriceUsd: number | null;
   takeProfitPriceUsd: number | null;
+  /** TP partiel déjà exécuté : le reste de la position continue de courir. */
+  partialTpTaken: boolean;
   openedAt: number;
   updatedAt: number;
   closedAt: number | null;
@@ -42,6 +44,7 @@ interface PositionDbRow {
   peak_price_usd: number | null;
   stop_loss_price_usd: number | null;
   take_profit_price_usd: number | null;
+  partial_tp_taken: number;
   opened_at: number;
   updated_at: number;
   closed_at: number | null;
@@ -71,6 +74,7 @@ function toDomain(row: PositionDbRow): PositionRow {
     peakPriceUsd: row.peak_price_usd,
     stopLossPriceUsd: row.stop_loss_price_usd,
     takeProfitPriceUsd: row.take_profit_price_usd,
+    partialTpTaken: row.partial_tp_taken === 1,
     openedAt: row.opened_at,
     updatedAt: row.updated_at,
     closedAt: row.closed_at,
@@ -325,6 +329,14 @@ export function updatePositionMarks(
     marks.stopLossPriceUsd === undefined ? position.stopLossPriceUsd : marks.stopLossPriceUsd,
     marks.takeProfitPriceUsd === undefined ? position.takeProfitPriceUsd : marks.takeProfitPriceUsd,
     marks.ts ?? Date.now(),
+    positionId,
+  );
+}
+
+/** Marque le TP partiel comme exécuté (le reste de la position continue). */
+export function markPartialTakeProfit(db: DatabaseSync, positionId: number, ts = Date.now()): void {
+  db.prepare('UPDATE positions SET partial_tp_taken = 1, updated_at = ? WHERE id = ?').run(
+    ts,
     positionId,
   );
 }

@@ -141,6 +141,13 @@ const TrailingStopSchema = z.strictObject({
   retrace_pct: z.number().min(0.1).default(3),
 });
 
+/** TP partiel : sécurise une fraction à +pct %, laisse courir le reste. */
+const PartialTakeProfitSchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  pct: z.number().min(0.1).max(1000).default(6),
+  fraction: z.number().min(0.01).max(0.99).default(0.5),
+});
+
 const RiskSchema = z.strictObject({
   max_position_pct: z.number().min(0.1).max(100).default(5),
   max_positions: z.number().int().min(1).max(50).default(6),
@@ -149,6 +156,7 @@ const RiskSchema = z.strictObject({
   max_drawdown_pct: z.number().min(0.1).max(100).default(15),
   stop_loss_pct: z.number().min(0.1).max(95).default(8),
   take_profit_pct: z.number().min(0.1).max(1000).default(15),
+  partial_take_profit: PartialTakeProfitSchema.default(PartialTakeProfitSchema.parse({})),
   trailing_stop: TrailingStopSchema.default(TrailingStopSchema.parse({})),
   max_slippage_bps: z.number().int().min(1).max(5000).default(100),
   min_time_between_trades_s: z.number().int().min(0).default(300),

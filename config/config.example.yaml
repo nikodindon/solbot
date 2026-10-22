@@ -64,6 +64,8 @@ risk: # le RiskManager a toujours le dernier mot
   max_drawdown_pct: 15 # drawdown max depuis le pic → kill-switch
   stop_loss_pct: 8
   take_profit_pct: 15
+  # TP partiel (optionnel) : sécurise `fraction` de la position à +`pct` %, le reste continue.
+  partial_take_profit: { enabled: false, pct: 6, fraction: 0.5 }
   trailing_stop: { activation_pct: 6, retrace_pct: 3 }
   max_slippage_bps: 100 # utilisé si execution.slippage n'est pas 'rtse'
   min_time_between_trades_s: 300

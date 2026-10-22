@@ -435,6 +435,76 @@ describe('Engine — sorties', () => {
     h.db.close();
   });
 
+  it('sécurise la moitié au TP partiel, puis laisse courir le reste', async () => {
+    const h = harness({
+      configOverrides: {
+        risk: {
+          partial_take_profit: { enabled: true, pct: 6, fraction: 0.5 },
+          // Trailing désactivé à +6 % pour isoler le TP partiel.
+          trailing_stop: { activation_pct: 20, retrace_pct: 3 },
+        },
+      },
+    });
+    const position = openPosition(h.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '10000000',
+      priceUsd: 2,
+      ts: NOW - 1_000,
+      stopLossPriceUsd: 1.8,
+      takeProfitPriceUsd: 2.4,
+    });
+
+    // +6 % → sécurise 50 %, le reste continue.
+    h.prices.set(A, price(2.12));
+    const first = await h.engine.runOnce();
+    expect(first.exits).toHaveLength(1);
+    expect(first.exits[0]).toContain('prise de profit partielle');
+    const afterPartial = getPositionById(h.db, position.id)!;
+    expect(afterPartial.status).toBe('open');
+    expect(afterPartial.partialTpTaken).toBe(true);
+    expect(qtyToFloat(afterPartial.qtyRemaining, 6)).toBeCloseTo(5, 6);
+    expect(getRecentTrades(h.db)[0]).toMatchObject({ trigger: 'partial_take_profit' });
+
+    // Même prix : le TP partiel ne se rejoue pas.
+    const second = await h.engine.runOnce();
+    expect(second.exits).toEqual([]);
+    expect(getPositionById(h.db, position.id)!.status).toBe('open');
+
+    // +20 % → le TP plein solde le reste.
+    h.prices.set(A, price(2.4));
+    const third = await h.engine.runOnce();
+    expect(third.exits[0]).toContain('take-profit');
+    expect(getPositionById(h.db, position.id)!.status).toBe('closed');
+    h.db.close();
+  });
+
+  it('ne déclenche pas le TP partiel quand il est désactivé', async () => {
+    const h = harness({
+      configOverrides: { risk: { trailing_stop: { activation_pct: 20, retrace_pct: 3 } } },
+    });
+    const position = openPosition(h.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '10000000',
+      priceUsd: 2,
+      ts: NOW - 1_000,
+      stopLossPriceUsd: 1.8,
+      takeProfitPriceUsd: 2.4,
+    });
+
+    h.prices.set(A, price(2.12)); // +6 %
+    const result = await h.engine.runOnce();
+    expect(result.exits).toEqual([]);
+    const unchanged = getPositionById(h.db, position.id)!;
+    expect(unchanged.status).toBe('open');
+    expect(unchanged.partialTpTaken).toBe(false);
+    expect(qtyToFloat(unchanged.qtyRemaining, 6)).toBeCloseTo(10, 6);
+    h.db.close();
+  });
+
   it('fait monter le stop avec le trailing et sort au retournement', async () => {
     const h = harness();
     const position = openPosition(h.db, {

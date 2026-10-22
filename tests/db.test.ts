@@ -19,14 +19,14 @@ function memoryDb() {
 describe('migrations', () => {
   it('applique les migrations une seule fois et_versionne', () => {
     const db = openDatabase(':memory:');
-    expect(runMigrations(db)).toBe(5);
+    expect(runMigrations(db)).toBe(6);
     expect(runMigrations(db)).toBe(0);
-    expect(currentSchemaVersion(db)).toBe(5);
+    expect(currentSchemaVersion(db)).toBe(6);
     expect(currentSchemaVersion(openDatabase(':memory:'))).toBe(0);
     db.close();
   });
 
-  it('crée les tables du moteur (v3), de la Phase 4 (v4) et de la Phase 6 (v5)', () => {
+  it('crée les tables du moteur (v3), de la Phase 4 (v4), de la Phase 6 (v5) et du TP partiel (v6)', () => {
     const db = memoryDb();
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -74,6 +74,7 @@ describe('migrations', () => {
       .all()
       .map((row) => (row as unknown as { name: string }).name);
     expect(positionColumns).toContain('mode');
+    expect(positionColumns).toContain('partial_tp_taken');
     db.close();
   });
 });
