@@ -17,7 +17,7 @@ import {
 } from '../state/bot-state.js';
 import { insertEquityPoint } from '../state/equity.js';
 import { insertEvent } from '../state/events.js';
-import { getCandles, type Candle } from '../state/market-data.js';
+import { getCandles, latestPriceUsd, type Candle } from '../state/market-data.js';
 import {
   openPosition,
   reducePositionFifo,
@@ -43,6 +43,12 @@ import { sleep } from '../utils/retry.js';
 export type EngineMode = 'paper' | 'dry_run' | 'live';
 
 const MAX_CONSECUTIVE_ERRORS = 5;
+/**
+ * Nombre de ticks consécutifs au-delà d'un seuil global (drawdown max ou perte
+ * journalière) avant de déclencher le garde-fou. Évite qu'un prix aberrant
+ * isolé (pic de données) ne coupe les entrées ou ne tue le moteur.
+ */
+const RISK_BREACH_CONFIRM_TICKS = 2;
 
 export interface EngineDeps {
   db: DatabaseSync;
@@ -124,8 +130,12 @@ export class Engine {
   private readonly paperCosts: PaperCosts;
   private stopRequested = false;
   private tradeInFlight = false;
-  /** Variation de caisse (USD) des trades exécutés pendant le tick courant — live. */
+  /** Fragment de caisse (USD) des trades exécutés pendant le tick courant — live. */
   private tickCashDeltaUsd = 0;
+  /** Ticks consécutifs sous le seuil de drawdown (anti-faux positif sur un tick isolé). */
+  private drawdownBreachStreak = 0;
+  /** Ticks consécutifs sous le seuil de perte journalière. */
+  private dailyLossBreachStreak = 0;
 
   constructor(private readonly deps: EngineDeps) {
     if ((deps.mode === 'live' || deps.mode === 'dry_run') && deps.executor === undefined) {
@@ -266,6 +276,26 @@ export class Engine {
     if (!prices.has(base.mint)) {
       prices.set(base.mint, base.mint === USDC_MINT ? 1 : null);
     }
+
+    // Valorisation : un poll incomplet ne doit jamais ramener une position à 0 $.
+    // On complète les mints détenus sans prix frais avec le dernier prix connu.
+    // `pricesComplete` reste faux tant qu'un prix manque, pour neutraliser les
+    // garde-fous globaux (drawdown / perte journalière) sur des données partielles.
+    const valuationPrices = new Map(prices);
+    let pricesComplete = true;
+    let valuationComplete = true;
+    for (const position of startPositions) {
+      const fresh = prices.get(position.mint);
+      if (fresh === undefined || fresh === null || !(fresh > 0)) {
+        pricesComplete = false;
+        const last = latestPriceUsd(db, position.mint);
+        if (last !== null && last > 0) {
+          valuationPrices.set(position.mint, last);
+        } else {
+          valuationComplete = false;
+        }
+      }
+    }
     const solPriceUsd = prices.get(SOL_MINT) ?? null;
     const basePriceUsd = base.mint === USDC_MINT ? 1 : solPriceUsd;
     this.tickCashDeltaUsd = 0;
@@ -282,12 +312,14 @@ export class Engine {
     }
 
     // ── 3. Valorisation + garde-fous globaux ───────────────────────────────
-    const snapshot = this.portfolio.snapshot({ cashUsd, prices, ts });
-    const peak = Math.max(
-      getNumberState(db, STATE_KEYS.navPeakUsd) ?? snapshot.navUsd,
-      snapshot.navUsd,
-    );
-    if (getNumberState(db, STATE_KEYS.navPeakUsd) !== peak) {
+    const snapshot = this.portfolio.snapshot({ cashUsd, prices: valuationPrices, ts });
+    const storedPeak = getNumberState(db, STATE_KEYS.navPeakUsd);
+    // Sur une valorisation partielle, le pic n'est pas mis à jour (un prix
+    // incomplet pourrait le gonfler artificiellement).
+    const peak = pricesComplete
+      ? Math.max(storedPeak ?? snapshot.navUsd, snapshot.navUsd)
+      : (storedPeak ?? snapshot.navUsd);
+    if (pricesComplete && storedPeak !== peak) {
       setNumberState(db, STATE_KEYS.navPeakUsd, peak, ts);
     }
     const drawdownPct = peak > 0 ? Math.max(0, ((peak - snapshot.navUsd) / peak) * 100) : 0;
@@ -308,6 +340,19 @@ export class Engine {
     const dailyLossPct =
       dayStartNav > 0 ? Math.max(0, ((dayStartNav - snapshot.navUsd) / dayStartNav) * 100) : 0;
 
+    // Anti-faux positif : un seuil dépassé sur un seul tick (prix aberrant) ne
+    // suffit pas. Il faut plusieurs ticks consécutifs avec des données complètes.
+    this.drawdownBreachStreak =
+      pricesComplete && drawdownPct >= config.risk.max_drawdown_pct
+        ? this.drawdownBreachStreak + 1
+        : 0;
+    this.dailyLossBreachStreak =
+      pricesComplete && dailyLossPct >= config.risk.daily_loss_limit_pct
+        ? this.dailyLossBreachStreak + 1
+        : 0;
+    const drawdownConfirmed = this.drawdownBreachStreak >= RISK_BREACH_CONFIRM_TICKS;
+    const dailyLossConfirmed = this.dailyLossBreachStreak >= RISK_BREACH_CONFIRM_TICKS;
+
     let pausedUntilMs = getNumberState(db, STATE_KEYS.pausedUntilMs);
     if (pausedUntilMs !== null && pausedUntilMs <= ts) {
       deleteState(db, STATE_KEYS.pausedUntilMs);
@@ -319,7 +364,7 @@ export class Engine {
         ts,
       });
     }
-    if (dailyLossPct >= config.risk.daily_loss_limit_pct && pausedUntilMs === null) {
+    if (dailyLossConfirmed && pausedUntilMs === null) {
       pausedUntilMs = nextUtcMidnight(ts);
       setNumberState(db, STATE_KEYS.pausedUntilMs, pausedUntilMs, ts);
       insertEvent(db, {
@@ -334,7 +379,7 @@ export class Engine {
     const manualPaused = getState(db, STATE_KEYS.manualPaused) === '1';
     const entriesPaused = manualPaused || (pausedUntilMs !== null && pausedUntilMs > ts);
 
-    if (drawdownPct >= config.risk.max_drawdown_pct && !this.deps.stopFile.exists()) {
+    if (drawdownConfirmed && !this.deps.stopFile.exists()) {
       this.deps.stopFile.createIfAbsent();
       insertEvent(db, {
         level: 'error',
@@ -557,15 +602,23 @@ export class Engine {
     const finalCashUsd =
       mode === 'live' ? Math.max(0, cashUsd + this.tickCashDeltaUsd) : this.virtualCash();
     const finalTs = this.now();
-    const finalSnapshot = this.portfolio.snapshot({ cashUsd: finalCashUsd, prices, ts: finalTs });
-    insertEquityPoint(db, {
-      mode,
-      ts: finalTs,
-      navUsd: finalSnapshot.navUsd,
+    const finalSnapshot = this.portfolio.snapshot({
       cashUsd: finalCashUsd,
-      positionsValueUsd: finalSnapshot.positionsValueUsd,
-      openCount: finalSnapshot.openCount,
+      prices: valuationPrices,
+      ts: finalTs,
     });
+    // Une valorisation totalement incomplète fausserait la courbe d'equity :
+    // on n'enregistre le point que si toutes les positions ont un prix utilisable.
+    if (valuationComplete) {
+      insertEquityPoint(db, {
+        mode,
+        ts: finalTs,
+        navUsd: finalSnapshot.navUsd,
+        cashUsd: finalCashUsd,
+        positionsValueUsd: finalSnapshot.positionsValueUsd,
+        openCount: finalSnapshot.openCount,
+      });
+    }
 
     return {
       ts,

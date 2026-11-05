@@ -19,6 +19,7 @@ import {
 } from '../src/state/bot-state.js';
 import { openDatabase } from '../src/state/db.js';
 import { getRecentEvents } from '../src/state/events.js';
+import { insertTicks } from '../src/state/market-data.js';
 import { runMigrations } from '../src/state/migrations.js';
 import {
   getOpenPosition,
@@ -313,9 +314,10 @@ describe('Engine — entrées (paper)', () => {
     h.db.close();
   });
 
-  it('met les entrées en pause après la perte journalière limite', async () => {
+  it('met les entrées en pause après la perte journalière limite (2 ticks confirmés)', async () => {
+    const signals: Signal[] = [];
     const h = harness({
-      signals: [buySignal()],
+      signals,
       configOverrides: { risk: { daily_loss_limit_pct: 3 } },
     });
     h.prices.set(A, price(1));
@@ -323,6 +325,12 @@ describe('Engine — entrées (paper)', () => {
     setNumberState(h.db, STATE_KEYS.dayStartNavUsd, 1000, NOW);
     setNumberState(h.db, STATE_KEYS.paperCashUsdc, 950, NOW); // NAV 950 → −5 %
 
+    // Premier tick : la perte est réelle mais pas encore confirmée.
+    const first = await h.engine.runOnce();
+    expect(first.dailyLossPct).toBeCloseTo(5, 6);
+    expect(first.pausedUntilMs).toBeNull();
+
+    signals.push(buySignal());
     const result = await h.engine.runOnce();
 
     expect(result.dailyLossPct).toBeCloseTo(5, 6);
@@ -512,10 +520,16 @@ describe('Engine — sorties', () => {
 });
 
 describe('Engine — garde-fous globaux et états', () => {
-  it('déclenche le kill-switch drawdown (création du fichier STOP)', async () => {
+  it('déclenche le kill-switch drawdown après 2 ticks confirmés (création du STOP)', async () => {
     const h = harness({ configOverrides: { risk: { max_drawdown_pct: 15 } } });
     setNumberState(h.db, STATE_KEYS.navPeakUsd, 1000, NOW);
     setNumberState(h.db, STATE_KEYS.paperCashUsdc, 800, NOW); // −20 %
+
+    // Un seul tick ne suffit pas (anti-faux positif).
+    const first = await h.engine.runOnce();
+    expect(first.drawdownPct).toBeCloseTo(20, 6);
+    expect(h.stop.created).toBe(false);
+    expect(first.killSwitch).toBe(false);
 
     const result = await h.engine.runOnce();
 
@@ -523,6 +537,48 @@ describe('Engine — garde-fous globaux et états', () => {
     expect(h.stop.created).toBe(true);
     expect(result.killSwitch).toBe(true);
     expect(getRecentEvents(h.db).some((event) => event.kind === 'drawdown_kill_switch')).toBe(true);
+    h.db.close();
+  });
+
+  it('ne déclenche pas le kill-switch quand un prix manque (valorisation de secours)', async () => {
+    const h = harness({ configOverrides: { risk: { max_drawdown_pct: 15 } } });
+    // Position détenue : 100 unités × 2 $ = 200 $ de valeur.
+    openPosition(h.db, {
+      mint: A,
+      symbol: 'AAA',
+      decimals: 6,
+      qty: '100000000',
+      priceUsd: 2,
+      ts: NOW - 60_000,
+      stopLossPriceUsd: 1.8,
+      takeProfitPriceUsd: 2.4,
+    });
+    insertTicks(h.db, [
+      {
+        mint: A,
+        usdPrice: 2,
+        liquidityUsd: 1_000_000,
+        priceChange24h: 0,
+        blockId: null,
+        ts: NOW - 60_000,
+      },
+    ]);
+    setNumberState(h.db, STATE_KEYS.navPeakUsd, 1000, NOW);
+    setNumberState(h.db, STATE_KEYS.paperCashUsdc, 800, NOW); // 800 + 200 = 1000 → DD 0
+
+    // Le poll courant ne renvoie aucun prix : la valorisation doit utiliser le
+    // dernier prix connu (2 $), pas 0 $.
+    const result = await h.engine.runOnce();
+
+    expect(result.navUsd).toBeCloseTo(1000, 6);
+    expect(result.drawdownPct).toBeCloseTo(0, 6);
+    expect(result.killSwitch).toBe(false);
+    expect(h.stop.created).toBe(false);
+
+    // Deuxième tick sans prix : toujours aucune fausse alerte.
+    const second = await h.engine.runOnce();
+    expect(second.drawdownPct).toBeCloseTo(0, 6);
+    expect(h.stop.created).toBe(false);
     h.db.close();
   });
 

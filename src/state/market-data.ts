@@ -52,6 +52,21 @@ export function insertTicks(db: DatabaseSync, ticks: PriceTick[]): PriceTick[] {
   return enriched;
 }
 
+/**
+ * Dernier prix USD connu pour un mint (secours quand le poll courant ne fournit
+ * pas de prix : évite de valoriser une position à 0 $ et de fausser le NAV).
+ */
+export function latestPriceUsd(db: DatabaseSync, mint: string): number | null {
+  const row = db
+    .prepare(
+      `SELECT usd_price AS price FROM price_ticks
+       WHERE mint = ? AND usd_price IS NOT NULL
+       ORDER BY ts DESC, id DESC LIMIT 1`,
+    )
+    .get(mint) as unknown as { price: number } | undefined;
+  return row?.price ?? null;
+}
+
 /** Volume 24 h du dernier tick stocké pour un mint (pour les contextes hors poller). */
 export function latestVolume24h(db: DatabaseSync, mint: string): number | null {
   const row = db
