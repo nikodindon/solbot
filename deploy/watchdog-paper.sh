@@ -29,7 +29,7 @@ mkdir -p "$LOG_DIR"
 log() { printf '%s  %s\n' "$(date -u '+%F %T UTC')" "$*" | tee -a "$WATCH_LOG"; }
 
 # Un seul moteur à la fois : refuse de démarrer si un autre tourne déjà.
-if pgrep -f "src/index.ts start" >/dev/null 2>&1; then
+if pgrep -f "$ROOT/src/index.ts start" >/dev/null 2>&1; then
   log "un moteur tourne déjà → watchdog non démarré (évite un doublon)"
   exit 1
 fi
@@ -40,7 +40,7 @@ cleanup() {
   if [ -n "$child" ]; then
     log "arrêt demandé → arrêt du moteur"
     kill -TERM "$child" 2>/dev/null || true
-    pkill -TERM -f "src/index.ts start" 2>/dev/null || true
+    pkill -TERM -f "$ROOT/src/index.ts start" 2>/dev/null || true
     wait "$child" 2>/dev/null || true
   fi
   log "watchdog terminé"
