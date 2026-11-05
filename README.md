@@ -779,6 +779,12 @@ où la source s'arrête) et la liquidité est supposée **statique** en backtest
 de la watchlist, sinon `backtest.default_liquidity_usd`). Un backtest sur trop peu de données est
 signalé **non concluant** (`conclusive = false`).
 
+### 11.6 Journal des runs paper
+
+Le détail des campagnes paper (configuration, résultats, incidents, décisions) est tenu dans
+**[`docs/runs.md`](docs/runs.md)** : runs du principal, expérience A/B « TP partiel », resets,
+faux kill-switch et points ouverts.
+
 ---
 
 ## 12. Observabilité & production
