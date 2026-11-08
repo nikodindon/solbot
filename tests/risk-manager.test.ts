@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { RiskManager, type RiskContext } from '../src/risk/risk-manager.js';
+import { USDC_MINT } from '../src/constants.js';
 import { openDatabase } from '../src/state/db.js';
 import { runMigrations } from '../src/state/migrations.js';
 import { openPosition } from '../src/state/positions.js';
 import { getRecentRejections } from '../src/state/risk-rejections.js';
+import { insertTrade, type TradeRecord } from '../src/state/trades.js';
 import { parseConfig, type Config } from '../src/utils/config.js';
 
 const MINT = 'M'.repeat(44);
@@ -41,6 +43,30 @@ const entry = {
   priceUsd: 1,
   liquidityUsd: 1_000_000,
 };
+
+function stopLossTrade(createdAt: number): TradeRecord {
+  return {
+    mode: 'paper',
+    status: 'success',
+    signature: null,
+    requestId: null,
+    inputMint: MINT,
+    outputMint: USDC_MINT,
+    inAmount: '1000',
+    expectedOutAmount: null,
+    outAmount: null,
+    router: null,
+    feeBps: null,
+    feeMint: null,
+    priceImpact: null,
+    slippageBps: null,
+    realizedSlippageBps: null,
+    errorCode: null,
+    errorMessage: null,
+    createdAt,
+    trigger: 'stop_loss',
+  };
+}
 
 describe('RiskManager.checkEntry', () => {
   it('autorise et dimensionne (min des plafonds)', () => {
@@ -120,6 +146,44 @@ describe('RiskManager.checkEntry', () => {
     );
     expect(decision).toMatchObject({ allowed: false, rule: 'cooldown' });
     expect(getRecentRejections(db)[0]?.message).toContain('cooldown');
+    db.close();
+  });
+
+  it('bloque un symbole après 2 stop-loss dans la journée (anti-churn)', () => {
+    const db = memoryDb();
+    const risk = new RiskManager(db, testConfig({ max_stop_losses_per_symbol_per_day: 2 }));
+
+    insertTrade(db, stopLossTrade(NOW - 120_000));
+    // Un seul stop aujourd'hui : l'entrée reste autorisée.
+    expect(risk.checkEntry(entry, context()).allowed).toBe(true);
+
+    insertTrade(db, stopLossTrade(NOW - 60_000));
+    const decision = risk.checkEntry(entry, context());
+
+    expect(decision).toMatchObject({ allowed: false, rule: 'symbol_stop_loss_ban' });
+    expect(getRecentRejections(db)[0]?.message).toContain("2 stop-loss aujourd'hui");
+    db.close();
+  });
+
+  it('ignore les stop-loss de la veille pour le blocage journalier', () => {
+    const db = memoryDb();
+    const risk = new RiskManager(db, testConfig({ max_stop_losses_per_symbol_per_day: 2 }));
+
+    insertTrade(db, stopLossTrade(NOW - 86_400_000));
+    insertTrade(db, stopLossTrade(NOW - 86_400_000 + 60_000));
+
+    expect(risk.checkEntry(entry, context()).allowed).toBe(true);
+    db.close();
+  });
+
+  it('désactive le blocage journalier quand la limite vaut 0', () => {
+    const db = memoryDb();
+    const risk = new RiskManager(db, testConfig({ max_stop_losses_per_symbol_per_day: 0 }));
+
+    insertTrade(db, stopLossTrade(NOW - 60_000));
+    insertTrade(db, stopLossTrade(NOW - 30_000));
+
+    expect(risk.checkEntry(entry, context()).allowed).toBe(true);
     db.close();
   });
 

@@ -627,13 +627,14 @@ Points de conception à connaître :
 Le RiskManager est **l'autorité finale** : un signal, même excellent, peut être rejeté.
 Il applique, dans l'ordre :
 
-1. **Kill-switch global** — fichier `STOP` présent, signal d'arrêt reçu, ou drawdown max atteint → liquidation neige : plus aucune entrée.
-2. **Limite de perte journalière** — perte cumulée > `daily_loss_limit_pct` → pause 24 h (reprise automatique au reset UTC).
+1. **Kill-switch global** — fichier `STOP` présent, signal d'arrêt reçu, ou drawdown max atteint → liquidation neige : plus aucune entrée. Un seuil n'est confirmé qu'après **2 ticks consécutifs** (protection contre un prix aberrant isolé).
+2. **Limite de perte journalière** — perte cumulée > `daily_loss_limit_pct` → pause des entrées jusqu'au prochain minuit UTC (reprise automatique au reset UTC).
 3. **Plafonds d'exposition** — positions ouvertes, exposition par actif, NAV engagé.
 4. **Sizing** — taille = `min(max_position_pct × NAV, exposition restante, contrainte de liquidité)`. La contrainte de liquidité utilise le prix/impact estimé (rejet si impact > `max_price_impact_pct`).
 5. **Cooldowns** — délai minimum entre deux trades sur le même actif (anti-churn).
-6. **Réserve de gaz** — le SOL sous `sol_gas_reserve` n'est jamais vendu ; le bot refuse un trade si les frais estimés mangent la réserve.
-7. **Garde de sortie** — stop-loss, take-profit, trailing stop appliqués à chaque tick, avec priorité absolue sur toute entrée.
+6. **Blocage journalier par symbole** — après `max_stop_losses_per_symbol_per_day` stop-loss sur un même actif dans la journée UTC, les nouvelles entrées sur cet actif sont refusées (`0` = désactivé).
+7. **Réserve de gaz** — le SOL sous `sol_gas_reserve` n'est jamais vendu ; le bot refuse un trade si les frais estimés mangent la réserve.
+8. **Garde de sortie** — stop-loss, take-profit, trailing stop appliqués à chaque tick, avec priorité absolue sur toute entrée.
 
 Chaque rejet est journalisé avec sa raison (`risk_rejections` en base) : en fin de journée, le rapport
 Telegram inclut le compteur de rejets par motif — outil de réglage essentiel.

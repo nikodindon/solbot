@@ -61,13 +61,14 @@ risk: # le RiskManager a toujours le dernier mot
   max_position_pct: 6.5 # % du NAV par position (+30 % vs 5 % : marché en réveil)
   max_positions: 14 # nombre max de positions ouvertes simultanément (14 × 6,5 % ≈ 91 % du NAV, ~9 % de réserve)
   max_asset_exposure_pct: 15 # % du NAV max sur un même actif
-  daily_loss_limit_pct: 3 # perte journalière max → pause automatique 24 h
+  daily_loss_limit_pct: 3 # perte journalière max → pause des entrées jusqu'à minuit UTC
   max_drawdown_pct: 15 # drawdown max depuis le pic → kill-switch
   stop_loss_pct: 8
   take_profit_pct: 15
   trailing_stop: { activation_pct: 6, retrace_pct: 3 }
   max_slippage_bps: 100 # utilisé si execution.slippage n'est pas 'rtse'
   min_time_between_trades_s: 1800 # 30 min anti-churn : évite de racheter juste après un stop/TP
+  max_stop_losses_per_symbol_per_day: 2 # anti-churn : bloque les entrées sur un symbole après 2 stop-loss dans la journée UTC (0 = désactivé)
   max_price_impact_pct: 1.0 # rejet si l'impact estimé dépasse ce seuil
   sol_gas_reserve: 0.05 # SOL intouchable, réservé aux frais
 

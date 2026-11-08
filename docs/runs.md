@@ -114,20 +114,56 @@ n'a **pas créé de performance** : les pertes venaient des stops, pas des gains
 Observations : beaucoup de petits stop-loss (−0,90 à −2,88 $), un seul gagnant par run
 (OPENAI), durée moyenne de détention **~50 min**. Net : −0,4 % / −0,6 %.
 
+### Point d'étape du 08/11 (~11:00 UTC)
+
+|                    | Principal               | A/B                    |
+| ------------------ | ----------------------- | ---------------------- |
+| NAV                | **898,83 $** (−10,12 %) | **931,86 $** (−6,81 %) |
+| Caisse             | 723,78 $                | 688,99 $               |
+| Positions          | 3                       | 4                      |
+| Drawdown / pic     | **10,25 %**             | **6,94 %**             |
+| Trades fermés      | 110                     | 113                    |
+| Gagnants           | 18 (**16 %**)           | 18 (**16 %**)          |
+| PnL réalisé        | **−100,24 $**           | **−67,09 $**           |
+| TP partiels        | 0                       | **12**                 |
+| Kill-switch / STOP | aucun                   | aucun                  |
+
+- Le marché est **franchement baissier** : −3 à −4 %/jour depuis le 06/11. Le principal
+  encaisse plus fort que l'A/B.
+- **Le principal approche du kill-switch** (DD 10,25 % sur un seuil de 15 %). Au rythme
+  actuel, il pourrait se déclencher vers le **10/11** si la baisse continue.
+- Pauses journalières **réelles** sur le principal : 06/11 22:29 (3,02 %) et 07/11 17:25
+  (3,15 %) → entrées coupées jusqu'à minuit UTC.
+- **A/B devant de ~33 $**, mais l'écart s'explique surtout par le timing d'entrée sur
+  quatre actifs, pas par le TP partiel :
+
+  | Actif | Principal  | A/B        | Écart      |
+  | ----- | ---------- | ---------- | ---------- |
+  | ZCAT  | −14,27 (5) | +2,81 (1)  | **+17,08** |
+  | 1WIN  | −2,11 (1)  | +10,43 (2) | **+12,54** |
+  | FLOAT | −8,67 (1)  | −1,96 (2)  | **+6,71**  |
+  | GATO  | −11,40 (5) | −7,47 (5)  | **+3,93**  |
+
+- **Fuite principale identifiée : le churn.** Le bot ré-entrait en boucle sur les mêmes
+  actifs perdants (ZCAT 5 entrées / GATO 5 entrées sur le principal).
+  → Décision : règle **`max_stop_losses_per_symbol_per_day: 2`** (blocage des nouvelles
+  entrées sur un symbole après 2 stop-loss dans la journée UTC ; `0` = désactivé).
+
 ---
 
 ## Incidents & décisions transverses
 
-| Date  | Événement                             | Décision / action                                             |
-| ----- | ------------------------------------- | ------------------------------------------------------------- |
-| 20/10 | Besoin de continuité                  | Watchdog `deploy/watchdog-paper.sh` (scan 12 h, relance auto) |
-| 21/10 | Trop de positions / actif indésirable | Sizing 6,5 % / 14 positions, blacklist SPCXx                  |
-| 22/10 | Tester le TP partiel                  | Branche `feat/tp-partiel`, instance A/B séparée               |
-| 23/10 | Coupure réseau                        | Watchdog dédié A/B + relance auto                             |
-| 28/10 | Drawdown 15,19 %                      | Kill-switch, puis **reset** à 1 000 $                         |
-| 04/11 | Reboot PC, DD ≥15 %                   | Kill-switch, puis **reset** à 1 000 $                         |
-| 05/11 | Faux kill-switch (prix manquant)      | Dégel + correctif `9710bb1` + tests                           |
-| 05/11 | Le watchdog pouvait tuer solbot3      | Motifs `pgrep`/`pkill` limités à `$ROOT` (`81ad1f0`)          |
+| Date  | Événement                                 | Décision / action                                                    |
+| ----- | ----------------------------------------- | -------------------------------------------------------------------- |
+| 20/10 | Besoin de continuité                      | Watchdog `deploy/watchdog-paper.sh` (scan 12 h, relance auto)        |
+| 21/10 | Trop de positions / actif indésirable     | Sizing 6,5 % / 14 positions, blacklist SPCXx                         |
+| 22/10 | Tester le TP partiel                      | Branche `feat/tp-partiel`, instance A/B séparée                      |
+| 23/10 | Coupure réseau                            | Watchdog dédié A/B + relance auto                                    |
+| 28/10 | Drawdown 15,19 %                          | Kill-switch, puis **reset** à 1 000 $                                |
+| 04/11 | Reboot PC, DD ≥15 %                       | Kill-switch, puis **reset** à 1 000 $                                |
+| 05/11 | Faux kill-switch (prix manquant)          | Dégel + correctif `9710bb1` + tests                                  |
+| 05/11 | Le watchdog pouvait tuer solbot3          | Motifs `pgrep`/`pkill` limités à `$ROOT` (`81ad1f0`)                 |
+| 08/11 | Churn : ZCAT ×5, GATO ×5 sur le principal | `max_stop_losses_per_symbol_per_day: 2` (blocage après 2 stops/jour) |
 
 ### Points ouverts
 
