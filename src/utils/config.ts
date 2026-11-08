@@ -160,6 +160,11 @@ const RiskSchema = z.strictObject({
   trailing_stop: TrailingStopSchema.default(TrailingStopSchema.parse({})),
   max_slippage_bps: z.number().int().min(1).max(5000).default(100),
   min_time_between_trades_s: z.number().int().min(0).default(300),
+  /**
+   * Anti-churn : nombre max de stop-loss sur un même symbole dans la journée
+   * UTC avant de bloquer les nouvelles entrées sur ce symbole (0 = désactivé).
+   */
+  max_stop_losses_per_symbol_per_day: z.number().int().min(0).max(20).default(2),
   max_price_impact_pct: percent.default(1),
   sol_gas_reserve: z.number().min(0).default(0.05),
 });

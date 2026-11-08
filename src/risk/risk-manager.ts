@@ -15,6 +15,7 @@ export type RiskRule =
   | 'unknown_liquidity'
   | 'exposure_cap'
   | 'cooldown'
+  | 'symbol_stop_loss_ban'
   | 'gas_reserve'
   | 'size_too_small'
   | 'empty_position';
@@ -61,9 +62,10 @@ export type RiskDecision =
 /**
  * Gestionnaire de risque (section 9 du README). Ordre des contrôles d'entrée :
  * kill-switch → pause perte journalière → plafonds d'exposition et sizing →
- * cooldown → réserve de gaz → notionnel minimum. Les **sorties** (stop-loss,
- * take-profit, trailing, signal de sortie) ne sont jamais bloquées par le
- * kill-switch ni par la pause : la garde de sortie est prioritaire.
+ * cooldown → blocage journalier par symbole (stops répétés) → réserve de gaz →
+ * notionnel minimum. Les **sorties** (stop-loss, take-profit, trailing, signal
+ * de sortie) ne sont jamais bloquées par le kill-switch ni par la pause : la
+ * garde de sortie est prioritaire.
  */
 export class RiskManager {
   constructor(
@@ -151,6 +153,27 @@ export class RiskManager {
           lastTradeTs,
           cooldownS: risk.min_time_between_trades_s,
         });
+      }
+    }
+
+    // ── Blocage journalier par symbole après stops répétés (anti-churn) ───
+    // Évite de ré-entrer en boucle sur un actif qui accumule les stop-loss.
+    const maxSymbolStops = risk.max_stop_losses_per_symbol_per_day;
+    if (maxSymbolStops > 0) {
+      const dayStart = Math.floor(ctx.now / 86_400_000) * 86_400_000;
+      const { n } = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM trades
+           WHERE trigger = 'stop_loss' AND input_mint = ?
+             AND created_at >= ? AND created_at <= ?`,
+        )
+        .get(intent.mint, dayStart, ctx.now) as unknown as { n: number };
+      if (n >= maxSymbolStops) {
+        return reject(
+          'symbol_stop_loss_ban',
+          `symbole bloqué : ${n} stop-loss aujourd'hui sur ${intent.symbol} (limite ${maxSymbolStops}/jour)`,
+          { stopLossesToday: n, maxStopLossesPerDay: maxSymbolStops },
+        );
       }
     }
 
